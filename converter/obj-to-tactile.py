@@ -17,7 +17,11 @@ import tactile_constants as tc
 
 perf_clock = getattr(time, 'perf_counter', time.time)
 
-sys.path.insert(1, "%s/blender/2.78/python/lib/python3.5/svgwrite" % (script_dir,))
+# Try the Blender 2.78 bundled svgwrite location first; if it doesn't exist
+# (e.g. newer Blender or custom install), fall back to system Python path.
+_b278_svgwrite = os.path.join(script_dir, 'blender', '2.78', 'python', 'lib', 'python3.5', 'svgwrite')
+if os.path.isdir(_b278_svgwrite):
+    sys.path.insert(1, _b278_svgwrite)
 # These modules imported at the site of use
 
 
@@ -41,7 +45,7 @@ def do_cmdline():
 
 def print_verts(ob):
     for v in ob.data.vertices:
-        print(ob.name, ob.matrix_world * mathutils.Vector(v.co))
+        print(ob.name, ob.matrix_world @ mathutils.Vector(v.co))
 
 def get_minimum_coordinate(ob):
     min_x, min_y, min_z, _max_x, _max_y, _max_z = get_object_world_bounds(ob)
@@ -49,7 +53,7 @@ def get_minimum_coordinate(ob):
 
 
 def get_object_world_bounds(ob):
-    bbox_corners = [ob.matrix_world * mathutils.Vector(corner) for corner in ob.bound_box]
+    bbox_corners = [ob.matrix_world @ mathutils.Vector(corner) for corner in ob.bound_box]
     min_x = 1000000
     min_y = 1000000
     min_z = 1000000
@@ -91,7 +95,7 @@ def add_polygons(dwg, g, ob):
     for polygon in mesh.polygons:
         points = []
         for vert_index in polygon.vertices:
-            world_co = ob.matrix_world * verts[vert_index].co
+            world_co = ob.matrix_world @ verts[vert_index].co
             points.append(('%.1f' % world_co[0], '%.1f' % world_co[1]))
         g.add(dwg.polygon(points=points))
 
@@ -116,7 +120,17 @@ def export_svg(base_path, args):
     min_x, min_y, max_x, max_y = (args.min_x, args.min_y, args.max_x, args.max_y)
     one_cm_units = (max_y - min_y) / args.size
 
-    import svgwrite
+    try:
+        import svgwrite
+    except ImportError:
+        try:
+            import subprocess
+            print("svgwrite not found, installing...")
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', 'svgwrite==1.1.9'])
+            import svgwrite
+        except Exception as e:
+            print("WARNING: svgwrite unavailable, skipping SVG export: " + str(e))
+            return
     dwg = svgwrite.Drawing(base_path + '.svg', profile = 'basic')
     dwg['width']  = "%.2f" % (args.size) + 'cm'
     dwg['height'] = "%.2f" % (args.size + 1) + 'cm'
@@ -197,8 +211,13 @@ def export_svg(base_path, args):
 
 def _export_stl(stl_path, scale):
     print("creating {stl}...".format(stl=stl_path))
-    bpy.ops.export_mesh.stl(filepath=stl_path, check_existing=False, \
-                            axis_forward='Y', axis_up='Z', global_scale=(1000 / scale))
+    try:
+        bpy.ops.export_mesh.stl(filepath=stl_path, check_existing=False,
+                                axis_forward='Y', axis_up='Z', global_scale=(1000 / scale))
+    except AttributeError:
+        # Blender 4.x: new operator with renamed parameters
+        bpy.ops.wm.stl_export(filepath=stl_path, check_existing=False,
+                              forward_axis='Y', up_axis='Z', global_scale=(1000 / scale))
 
 def export_stl(base_path, scale):
     bpy.ops.object.select_all(action='SELECT')
@@ -207,7 +226,7 @@ def export_stl(base_path, scale):
 def export_stl_separate(base_path, scale):
     bpy.ops.object.select_all(action='DESELECT')
     for ob in bpy.context.scene.objects:
-        ob.select = ob.name.endswith('Roads') or ob.name.endswith('RoadAreas') or ob.name.endswith('Rails')
+        ob.select_set(ob.name.endswith('Roads') or ob.name.endswith('RoadAreas') or ob.name.endswith('Rails'))
     _export_stl(base_path + '-ways.stl', scale)
     bpy.ops.object.select_all(action='INVERT')
     _export_stl(base_path + '-rest.stl', scale)
@@ -219,6 +238,12 @@ def export_blend_file(base_path):
 
 
 def export_wireframe_png(base_path, output_name, min_x, min_y, max_x, max_y):
+    try:
+        _export_wireframe_png_impl(base_path, output_name, min_x, min_y, max_x, max_y)
+    except Exception as e:
+        print("WARNING: wireframe PNG not supported in this Blender version: " + str(e))
+
+def _export_wireframe_png_impl(base_path, output_name, min_x, min_y, max_x, max_y):
     t = time.time()
     wireframe_path = base_path + '-' + output_name + '.png'
     width = max_x - min_x
@@ -287,7 +312,7 @@ def export_wireframe_png(base_path, output_name, min_x, min_y, max_x, max_y):
 
         solid_ob = ob.copy()
         solid_ob.data = ob.data.copy()
-        scene.objects.link(solid_ob)
+        scene.collection.objects.link(solid_ob)
         solid_ob.hide_render = False
         mesh = solid_ob.data
         if len(mesh.materials) == 0:
@@ -299,7 +324,7 @@ def export_wireframe_png(base_path, output_name, min_x, min_y, max_x, max_y):
 
         wire_ob = solid_ob.copy()
         wire_ob.data = solid_ob.data.copy()
-        scene.objects.link(wire_ob)
+        scene.collection.objects.link(wire_ob)
         wire_ob.hide_render = False
         wire_mesh = wire_ob.data
         if len(wire_mesh.materials) == 0:
@@ -314,11 +339,11 @@ def export_wireframe_png(base_path, output_name, min_x, min_y, max_x, max_y):
 
     bpy.ops.object.select_all(action='DESELECT')
     for ob in solid_overlay_objects:
-        ob.select = True
+        ob.select_set(True)
     for ob in wire_overlay_objects:
-        ob.select = True
-    camera.select = True
-    bpy.context.scene.objects.active = camera
+        ob.select_set(True)
+    camera.select_set(True)
+    bpy.context.view_layer.objects.active = camera
     bpy.ops.object.delete()
     for (ob, old_hide_render) in hidden_originals:
         ob.hide_render = old_hide_render
@@ -340,7 +365,7 @@ def create_cube(min_x, min_y, max_x, max_y, min_z, max_z):
     bpy.ops.object.mode_set(mode = 'OBJECT')
     cube.location = [ (x1 + x2) / 2, (y1 + y2) / 2, (z1 + z2) / 2 ]
     cube.scale = [ (x2 - x1) / 2, (y2 - y1) / 2, (z2 - z1) / 2 ]
-    bpy.context.scene.update() # flush changes to location and scale
+    bpy.context.view_layer.update() # flush changes to location and scale
     return cube
 
 def add_borders(min_x, min_y, max_x, max_y, width, bottom, height, corner_height):
@@ -426,11 +451,19 @@ def import_mesh_file(mesh_path):
     old_names = set((ob.name for ob in bpy.context.scene.objects if ob.type == 'MESH'))
     extension = os.path.splitext(mesh_path)[1].lower()
     if extension == '.obj':
-        bpy.ops.import_scene.obj(filepath=mesh_path, axis_forward='-Z', axis_up='Y')
+        try:
+            # Blender 3.3+ new operator
+            bpy.ops.wm.obj_import(filepath=mesh_path, forward_axis='NEGATIVE_Z', up_axis='Y')
+        except AttributeError:
+            bpy.ops.import_scene.obj(filepath=mesh_path, axis_forward='-Z', axis_up='Y')
     elif extension == '.ply':
-        if not hasattr(bpy.ops.import_mesh, 'ply'):
-            bpy.ops.wm.addon_enable(module='io_mesh_ply')
-        bpy.ops.import_mesh.ply(filepath=mesh_path)
+        try:
+            # Blender 4.x new operator
+            bpy.ops.wm.ply_import(filepath=mesh_path)
+        except AttributeError:
+            if not hasattr(bpy.ops.import_mesh, 'ply'):
+                bpy.ops.wm.addon_enable(module='io_mesh_ply')
+            bpy.ops.import_mesh.ply(filepath=mesh_path)
     else:
         raise Exception("unsupported mesh extension: " + extension)
 
@@ -453,7 +486,7 @@ def extrude_building(ob, height):
 
 def join_selected(name):
     combined = bpy.context.selected_objects[0]
-    bpy.context.scene.objects.active = combined
+    bpy.context.view_layer.objects.active = combined
     combined.name = name
     bpy.ops.object.join()
     return combined
@@ -463,18 +496,18 @@ def join_objects(objects, name):
         return None
     if len(objects) == 1:
         bpy.ops.object.select_all(action='DESELECT')
-        objects[0].select = True
-        bpy.context.scene.objects.active = objects[0]
+        objects[0].select_set(True)
+        bpy.context.view_layer.objects.active = objects[0]
         objects[0].name = name
         return objects[0]
     bpy.ops.object.select_all(action='DESELECT')
     for ob in objects:
-        ob.select = True
+        ob.select_set(True)
     return join_selected(name)
 
 def raise_ob(objs, height):
     bpy.ops.object.select_all(action='DESELECT')
-    bpy.context.scene.objects.active = objs
+    bpy.context.view_layer.objects.active = objs
     bpy.ops.object.mode_set(mode = 'EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.mesh.extrude_region_move(TRANSFORM_OT_translate={ "value": (0.0, 0.0, height) })
@@ -482,7 +515,7 @@ def raise_ob(objs, height):
 
 def water_remesh_and_extrude(object, extrude_height):
     # Extrude just enough that remeshing works
-    bpy.context.scene.objects.active = object
+    bpy.context.view_layer.objects.active = object
     bpy.ops.object.mode_set(mode = 'EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.mesh.extrude_region_move(TRANSFORM_OT_translate={ "value": (0.0, 0.0, extrude_height) })
@@ -495,7 +528,7 @@ def water_remesh_and_extrude(object, extrude_height):
     modifier = object.modifiers.new('Modifier', 'REMESH')
     modifier.octree_depth = math.ceil(depth)
     modifier.use_remove_disconnected = False
-    bpy.ops.object.modifier_apply(apply_as='DATA', modifier=modifier.name)
+    bpy.ops.object.modifier_apply(modifier=modifier.name)
 
 def water_wave_pattern(object, depth, scale):
     extrude_height = 1.0
@@ -524,7 +557,7 @@ def water_wave_pattern(object, depth, scale):
             v.co.z = max(min_height, (math.sin(v.co.x * density) + math.sin(v.co.y * density)) * depth / 4 + depth / 2)
         else:
             v.co.z = 0
-    bmesh.update_edit_mesh(object.data, tessface=False, destructive=False)
+    bmesh.update_edit_mesh(object.data, loop_triangles=False, destructive=False)
 
     bpy.ops.object.mode_set(mode = 'OBJECT')
 
@@ -550,7 +583,7 @@ def join_matching_edges(ob, min_x, min_y, max_x, max_y):
     dt = 0.15  # max distance 
     at = 0.5  # max sin(angle)  (30°)
     
-    bpy.context.scene.objects.active = ob
+    bpy.context.view_layer.objects.active = ob
     bpy.ops.object.mode_set(mode = 'EDIT')
     bpy.ops.mesh.select_all(action='DESELECT')
     from math import sin
@@ -671,21 +704,21 @@ def join_matching_edges(ob, min_x, min_y, max_x, max_y):
             
     print("%s: melding %d out of %d edges" % (ob.name, len(to_weld) / 2, len(bm.edges)))
     bmesh.ops.weld_verts(bm, targetmap = to_weld)
-    bmesh.update_edit_mesh(bpy.context.object.data ,True)
+    bmesh.update_edit_mesh(bpy.context.object.data, loop_triangles=True)
     bpy.ops.object.mode_set(mode = 'OBJECT')
 
 # Decimating gets rid of useless and harmful lane edges, as well as changing
 # tris to n-gons (important to find edge's "direction")
 def decimate(ob):
     # Decimating gets rid of useless lanes
-    bpy.context.scene.objects.active = ob
+    bpy.context.view_layer.objects.active = ob
     modifier = ob.modifiers.new('Modifier', 'DECIMATE')
     modifier.decimate_type = 'DISSOLVE'
-    bpy.ops.object.modifier_apply(apply_as='DATA', modifier=modifier.name)
+    bpy.ops.object.modifier_apply(modifier=modifier.name)
 
 # Fatten slightly to cause overlap and avoid faces too close to each other
 def fatten(ob):
-    bpy.context.scene.objects.active = ob
+    bpy.context.view_layer.objects.active = ob
     bpy.ops.object.mode_set(mode = 'EDIT')
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.transform.shrink_fatten(value=-0.05) # less than this and programs start to "remove double vertices"
@@ -762,7 +795,7 @@ def process_objects(min_x, min_y, max_x, max_y, scale, no_borders):
     if len(deleteables) > 0:
         bpy.ops.object.select_all(action='DESELECT')
         for ob in deleteables:
-            ob.select = True
+            ob.select_set(True)
         bpy.ops.object.delete()
         #print("deleting %d objects took %.2f" % (len(deleteables), perf_clock() - t))
 

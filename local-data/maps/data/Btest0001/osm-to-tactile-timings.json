@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "component": "osm-to-tactile",
+  "startedAtUtc": "2026-06-17 20:38:10.310",
+  "endedAtUtc": "2026-06-17 20:38:16.690",
+  "stages": [
+    {
+      "name": "run-osm2world",
+      "component": "run-osm2world",
+      "startedAtUtc": "2026-06-17 20:38:10.334",
+      "endedAtUtc": "2026-06-17 20:38:11.974",
+      "totalSec": 1.640316500001063,
+      "selfSec": 1.640316500001063,
+      "childSec": 0.0,
+      "maxRssKiB": null,
+      "children": []
+    },
+    {
+      "name": "run-clip-2d",
+      "component": "run-clip-2d",
+      "startedAtUtc": "2026-06-17 20:38:11.974",
+      "endedAtUtc": "2026-06-17 20:38:12.075",
+      "totalSec": 0.10125749999861,
+      "selfSec": 0.04103889999861001,
+      "childSec": 0.06021859999999999,
+      "maxRssKiB": null,
+      "children": [
+        {
+          "name": "clip-2d.parseSeconds",
+          "component": "clip-2d",
+          "totalSec": 0.023316999999999997,
+          "selfSec": 0.023316999999999997,
+          "childSec": 0.0,
+          "maxRssKiB": null,
+          "children": []
+        },
+        {
+          "name": "clip-2d.clipSeconds",
+          "component": "clip-2d",
+          "totalSec": 0.0164649,
+          "selfSec": 0.0164649,
+          "childSec": 0.0,
+          "maxRssKiB": null,
+          "children": []
+        },
+        {
+          "name": "clip-2d.dedupeWriteSeconds",
+          "component": "clip-2d",
+          "totalSec": 0.020436699999999995,
+          "selfSec": 0.020436699999999995,
+          "childSec": 0.0,
+          "maxRssKiB": null,
+          "children": []
+        }
+      ]
+    },
+    {
+      "name": "run-blender",
+      "component": "run-blender",
+      "startedAtUtc": "2026-06-17 20:38:12.075",
+      "endedAtUtc": "2026-06-17 20:38:16.635",
+      "totalSec": 4.5592908000035095,
+      "selfSec": 4.5592908000035095,
+      "childSec": 0.0,
+      "maxRssKiB": null,
+      "children": []
+    },
+    {
+      "name": "write-map-meta",
+      "component": "write-map-meta",
+      "startedAtUtc": "2026-06-17 20:38:16.635",
+      "endedAtUtc": "2026-06-17 20:38:16.690",
+      "totalSec": 0.05508279999776278,
+      "selfSec": 0.05508279999776278,
+      "childSec": 0.0,
+      "maxRssKiB": null,
+      "children": []
+    }
+  ],
+  "metaPath": "C:\\Users\\andre\\Documents\\ClaudeCode\\touch-mapper-claude\\local-data\\maps\\data\\Btest0001\\map-meta.json"
+}

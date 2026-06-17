@@ -81,9 +81,12 @@ function uriEncodeRequestId(rid) {
 }
 
 (function(){
-  var TM_HOST = "https://" + TM_DOMAIN;
+  // In local mode TM_LOCAL_SERVER is set in environment.js and all map URLs
+  // point to the local Express server instead of CloudFront / S3.
+  var LOCAL = window.TM_LOCAL_SERVER || null;
+  var TM_HOST = LOCAL || ("https://" + TM_DOMAIN);
   // XXX It would make more sense to have the S3 host in environment.js
-  var MAPS_S3_HOST = window.location.protocol + "//s3-" + TM_REGION + ".amazonaws.com/" + window.TM_ENVIRONMENT + ".maps.touch-mapper";
+  var MAPS_S3_HOST = LOCAL || (window.location.protocol + "//s3-" + (window.TM_REGION || 'us-east-1') + ".amazonaws.com/" + window.TM_ENVIRONMENT + ".maps.touch-mapper");
 
   function idStart(id) {
     return id.split('/', 2)[0];

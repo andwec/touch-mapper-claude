@@ -60,7 +60,6 @@
       "version": "4.11.8",
       "resolved": "https://registry.npmjs.org/ajv/-/ajv-4.11.8.tgz",
       "integrity": "sha512-I/bSHSNEcFFqXLf91nchoNB9D1Kie3QKcWdchYUaoIg1+1bdWDkdfdlvdIOJbi9U8xR0y+MWc5D+won9v95WlQ==",
-      "peer": true,
       "dependencies": {
         "co": "^4.6.0",
         "json-stable-stringify": "^1.0.1"

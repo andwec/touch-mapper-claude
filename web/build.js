@@ -79,7 +79,9 @@ var metalsmith = Metalsmith(__dirname)
         pattern: '**/three-addons/**/*.js',
         directory: 'scripts',
         transform: function (file) {
-            return file.replace(/^.*three-addons\//, 'scripts/three-addons/');
+            // Normalize to forward slashes so the regex works on Windows too
+            var normalized = file.replace(/\\/g, '/');
+            return normalized.replace(/^.*three-addons\//, 'scripts/three-addons/');
         },
         move: true,
     }))

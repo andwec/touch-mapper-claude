@@ -106,6 +106,19 @@
     pollProgress(startTime, requestId);
   }
 
+  function sendLocalRequest(msg) {
+    $.ajax({
+      type: "POST",
+      url: "/api/create-map",
+      contentType: "application/json",
+      data: JSON.stringify(msg)
+    }).done(function() {
+      sqsSendDone(msg.requestId);
+    }).fail(function(jqXHR, textStatus, errorThrown) {
+      showError("Local server error: " + textStatus + ": " + errorThrown);
+    });
+  }
+
   function sendSqsRequest(msg) {
     var body = encodeURIComponent(JSON.stringify(msg));
     $.ajax({
@@ -240,9 +253,13 @@
       };
     }
     $("#submit-button").val(window.TM.translations.progress__connecting);
-    withBrowserIp(msg, function() {
-      sendSqsRequest(msg);
-    });
+    if (window.TM_LOCAL_SERVER) {
+      sendLocalRequest(msg);
+    } else {
+      withBrowserIp(msg, function() {
+        sendSqsRequest(msg);
+      });
+    }
     //fbq('track', 'ViewContent');
   };
 

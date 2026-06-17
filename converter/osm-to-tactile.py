@@ -33,7 +33,7 @@ def pretty_json_enabled():
 
 
 def write_json_file(path, value, pretty_json):
-    with open(path, 'w') as handle:
+    with open(path, 'w', encoding='utf-8') as handle:
         if pretty_json:
             json.dump(value, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
@@ -85,9 +85,52 @@ def _parse_int_env(name, fallback):
         return fallback
 
 
+def _resolve_osm2world_path():
+    env_path = os.environ.get('TOUCH_MAPPER_OSM2WORLD_JAR')
+    if env_path:
+        return env_path
+    # Try via symlink (Linux production setup)
+    via_link = os.path.join(script_dir, 'OSM2World', 'build', 'OSM2World.jar')
+    if os.path.exists(via_link):
+        return via_link
+    # Fallback: OSM2World is a sibling of the converter/ directory
+    return os.path.join(os.path.dirname(script_dir), 'OSM2World', 'build', 'OSM2World.jar')
+
+
+def _resolve_blender_path():
+    env_path = os.environ.get('TOUCH_MAPPER_BLENDER_PATH')
+    if env_path:
+        return env_path
+    blender_dir = os.path.join(script_dir, 'blender')
+    if sys.platform == 'win32':
+        local_exe = os.path.join(blender_dir, 'blender.exe')
+        if os.path.exists(local_exe):
+            return local_exe
+        # Auto-detect from default Windows install location
+        for pf in filter(None, [os.environ.get('PROGRAMFILES'), os.environ.get('PROGRAMFILES(X86)')]):
+            bf_dir = os.path.join(pf, 'Blender Foundation')
+            if os.path.isdir(bf_dir):
+                for entry in sorted(os.listdir(bf_dir), reverse=True):
+                    candidate = os.path.join(bf_dir, entry, 'blender.exe')
+                    if os.path.exists(candidate):
+                        return candidate
+        return local_exe  # will fail with a clear error if not found
+    return os.path.join(blender_dir, 'blender')
+
+
+def _blender_env(blender_path):
+    # LD_LIBRARY_PATH is Linux-only; skip it on Windows
+    if sys.platform == 'win32':
+        return {}
+    blender_dir = os.path.dirname(os.path.realpath(blender_path))
+    return {
+        'LD_LIBRARY_PATH': os.path.join(blender_dir, 'lib') + ':' + os.environ.get('LD_LIBRARY_PATH', '')
+    }
+
+
 def run_osm2world(input_path, output_path, scale, exclude_buildings, telemetry):
     # Code below creates stage "OSM2World raw meta" data.
-    osm2world_path = os.path.join(script_dir, 'OSM2World', 'build', 'OSM2World.jar')
+    osm2world_path = _resolve_osm2world_path()
     #print(osm2world_path + " " + input_path + " " + output_path)
     cmd = [
         'java', '-Xmx1G',
@@ -113,7 +156,7 @@ def run_osm2world(input_path, output_path, scale, exclude_buildings, telemetry):
     meta_path = os.path.join(os.path.dirname(output_path), 'map-meta-raw.json')
     if not os.path.exists(meta_path):
         raise Exception("Couldn't find map-meta-raw.json from OSM2World output")
-    with open(meta_path, 'r') as f:
+    with open(meta_path, 'r', encoding='utf-8') as f:
         meta = json.load(f)
     write_json_file(meta_path, meta, pretty_json_enabled())
 
@@ -141,7 +184,7 @@ def run_clip_2d(obj_path, clip_bounds, telemetry):
 
     if not os.path.exists(clip_report_path):
         raise Exception("clip-2d did not produce report")
-    with open(clip_report_path, 'r') as f:
+    with open(clip_report_path, 'r', encoding='utf-8') as f:
         report = json.load(f)
     file_entries = report.get('files', [])
     mesh_paths = []
@@ -160,11 +203,8 @@ def run_clip_2d(obj_path, clip_bounds, telemetry):
 
 
 def run_blender(mesh_paths, boundary, args, output_base_path, telemetry):
-    blender_dir = os.path.join(script_dir, 'blender')
-    blender_env = {
-        'LD_LIBRARY_PATH': os.path.join(blender_dir, 'lib') + ":" + os.environ.get('LD_LIBRARY_PATH', '')
-    }
-    blender_path = os.path.join(blender_dir, 'blender')
+    blender_path = _resolve_blender_path()
+    blender_env = _blender_env(blender_path)
     obj_to_tactile_path = os.path.join(script_dir, 'obj-to-tactile.py')
     blender_args = [
         #'--debug',

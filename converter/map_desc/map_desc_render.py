@@ -2453,7 +2453,7 @@ def write_map_content(grouped: Dict[str, Any], spec: Dict[str, Any],
 
 def _load_json(path: str) -> OrderedDict:
     # Read JSON with stable key ordering for deterministic output.
-    with open(path, "r") as handle:
+    with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle, object_pairs_hook=OrderedDict)
 
 
@@ -2480,7 +2480,7 @@ def _pretty_json_enabled(pretty_json: Optional[bool] = None) -> bool:
 
 def _write_json_fast(path: str, value: Any, pretty_json: Optional[bool] = None) -> None:
     use_pretty = _pretty_json_enabled(pretty_json)
-    with open(path, "w") as handle:
+    with open(path, "w", encoding="utf-8") as handle:
         if use_pretty:
             json.dump(
                 value,

@@ -1,0 +1,4 @@
+Touch Mapper local server: http://localhost:3000
+
+Build the web UI first if you have not already:
+  cd web && python pre2src.py && node build.js

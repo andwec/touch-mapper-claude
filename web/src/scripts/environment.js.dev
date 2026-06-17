@@ -1,2 +1,5 @@
-window.TM_ENVIRONMENT = 'dev';
-window.TM_DOMAIN = 'dev';
+window.TM_ENVIRONMENT = 'local';
+window.TM_DOMAIN = 'localhost:3000';
+// Local mode: all API calls and map file URLs go to the local server.
+// Remove this line to use the AWS-backed production setup.
+window.TM_LOCAL_SERVER = 'http://localhost:3000';

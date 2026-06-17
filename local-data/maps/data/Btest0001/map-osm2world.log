@@ -1,0 +1,40 @@
+time terrain interpolation: 0:00:00.079
+time add constraints: 0:00:00.001
+time enforce constraints: 0:00:00.000
+ignored exception:
+java.lang.IllegalStateException: no connector information has been set for this representation.
+node: n11204975379
+	at org.osm2world.core.world.network.VisibleConnectorNodeWorldObject.checkInformationProvided(Unknown Source)
+	at org.osm2world.core.world.network.VisibleConnectorNodeWorldObject.getOutlineXZ(Unknown Source)
+	at org.osm2world.core.world.network.VisibleConnectorNodeWorldObject.getOutlinePolygonXZ(Unknown Source)
+	at org.osm2world.core.world.data.OutlineNodeWorldObject.getEleConnectors(Unknown Source)
+	at org.osm2world.core.world.data.OutlineNodeWorldObject.getEleConnectors(Unknown Source)
+	at org.osm2world.core.ConversionFacade$1.perform(Unknown Source)
+	at org.osm2world.core.ConversionFacade$1.perform(Unknown Source)
+	at org.osm2world.core.util.FaultTolerantIterationUtil.iterate(Unknown Source)
+	at org.osm2world.core.ConversionFacade.calculateElevations(Unknown Source)
+	at org.osm2world.core.ConversionFacade.createRepresentations(Unknown Source)
+	at org.osm2world.core.ConversionFacade.createRepresentations(Unknown Source)
+	at org.osm2world.console.Output.output(Unknown Source)
+	at org.osm2world.console.OSM2World.executeArgumentsGroup(Unknown Source)
+	at org.osm2world.console.OSM2World.main(Unknown Source)
+this exception occurred for the following input:
+RoadCrossingAtConnector(n11204975379)
+ignored exception summary (FaultTolerantIterationUtil.iterate): total=1
+ignored exception:
+java.lang.IllegalStateException: no connector information has been set for this representation.
+node: n11204975379
+	at org.osm2world.core.world.network.VisibleConnectorNodeWorldObject.checkInformationProvided(Unknown Source)
+	at org.osm2world.core.world.network.VisibleConnectorNodeWorldObject.getOutlineXZ(Unknown Source)
+	at org.osm2world.core.world.network.VisibleConnectorNodeWorldObject.getOutlinePolygonXZ(Unknown Source)
+	at org.osm2world.core.world.data.OutlineNodeWorldObject.getEleConnectors(Unknown Source)
+	at org.osm2world.core.world.modules.RoadModule$RoadCrossingAtConnector.renderTo(Unknown Source)
+	at org.osm2world.core.target.TargetUtil.renderObject(Unknown Source)
+	at org.osm2world.core.target.TargetUtil.renderWorldObjects(Unknown Source)
+	at org.osm2world.core.target.obj.ObjWriter.writeObjFile(Unknown Source)
+	at org.osm2world.console.Output.output(Unknown Source)
+	at org.osm2world.console.OSM2World.executeArgumentsGroup(Unknown Source)
+	at org.osm2world.console.OSM2World.main(Unknown Source)
+this exception occurred for the following input:
+n11204975379
+ignored exception summary (TargetUtil.renderWorldObjects): total=1
