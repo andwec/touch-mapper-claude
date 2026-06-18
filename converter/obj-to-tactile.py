@@ -148,6 +148,197 @@ class BuildingHeightLookup:
         return max(self.default, min(self.max_height, best_h))
 
 
+class WaterTowerPlacer:
+    """Maps water tower lat/lon from JSON to Blender (x, y) coordinates."""
+
+    def __init__(self, wt_data, min_x, min_y, max_x, max_y):
+        lon_min = wt_data['lon_min']; lon_max = wt_data['lon_max']
+        lat_min = wt_data['lat_min']; lat_max = wt_data['lat_max']
+        dx = max_x - min_x; dy = max_y - min_y
+        dlon = lon_max - lon_min; dlat = lat_max - lat_min
+        self.positions = []
+        for t in wt_data.get('towers', []):
+            if dlon > 0 and dlat > 0:
+                bx = min_x + (t['lon'] - lon_min) / dlon * dx
+                by = min_y + (t['lat'] - lat_min) / dlat * dy
+                self.positions.append((bx, by))
+
+
+class RoofShapeLookup:
+    """Spatial lookup: given Blender (x, y) returns roof shape string for nearest building."""
+
+    def __init__(self, rs_data, min_x, min_y, max_x, max_y):
+        lon_min = rs_data['lon_min']; lon_max = rs_data['lon_max']
+        lat_min = rs_data['lat_min']; lat_max = rs_data['lat_max']
+        dx = max_x - min_x; dy = max_y - min_y
+        dlon = lon_max - lon_min; dlat = lat_max - lat_min
+        self.entries = []
+        for b in rs_data.get('buildings', []):
+            if dlon > 0 and dlat > 0:
+                bx = min_x + (b['lon'] - lon_min) / dlon * dx
+                by = min_y + (b['lat'] - lat_min) / dlat * dy
+                self.entries.append((bx, by, b['roof_shape']))
+
+    def lookup(self, cx, cy, max_dist=30.0):
+        best_dist = max_dist * max_dist
+        best_shape = 'pyramidal'
+        for bx, by, shape in self.entries:
+            d2 = (bx - cx) ** 2 + (by - cy) ** 2
+            if d2 < best_dist:
+                best_dist = d2
+                best_shape = shape
+        return best_shape
+
+
+def _mesh_from_lod2_faces(name, faces_xyz, weld_eps=0.02):
+    """Build one closed Blender mesh from a list of polygon faces.
+
+    Vertices closer than weld_eps (metres) are merged so the separate LOD2
+    boundary surfaces (ground, walls, roof) stitch into a single watertight
+    solid. Returns the new object, or None if no usable face was created.
+    """
+    bm = bmesh.new()
+    vmap = {}
+
+    def vert_at(x, y, z):
+        key = (round(x / weld_eps), round(y / weld_eps), round(z / weld_eps))
+        v = vmap.get(key)
+        if v is None:
+            v = bm.verts.new((x, y, z))
+            vmap[key] = v
+        return v
+
+    for face in faces_xyz:
+        verts = []
+        for (x, y, z) in face:
+            v = vert_at(x, y, z)
+            # Skip consecutive duplicate vertices (common in GML rings).
+            if not verts or verts[-1] is not v:
+                verts.append(v)
+        # GML rings repeat the first point as the last; drop the closing repeat.
+        if len(verts) >= 2 and verts[0] is verts[-1]:
+            verts.pop()
+        if len(verts) < 3:
+            continue
+        try:
+            bm.faces.new(verts)
+        except ValueError:
+            pass  # duplicate face — ignore
+
+    if not bm.faces:
+        bm.free()
+        return None
+
+    # Weld any remaining coincident vertices, then make normals point outward.
+    bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=weld_eps)
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+
+    mesh = bpy.data.meshes.new(name)
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.update()
+    ob = bpy.data.objects.new(name, mesh)
+    bpy.context.scene.collection.objects.link(ob)
+    return ob
+
+
+def build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale):
+    """Create solid building meshes directly from LOD2 geometry.
+
+    Each LOD2 building is rebuilt as a complete closed solid (ground + walls +
+    roof) at its true map position, so the roof always lines up with the walls
+    and the result is watertight for 3D printing. Returns the list of created
+    objects. Buildings whose centroid is outside the map are skipped; vertices
+    that fall outside the map are clamped to the edge so nothing overhangs the
+    base plate.
+    """
+    lon_min = lod2_data['lon_min']; lon_max = lod2_data['lon_max']
+    lat_min = lod2_data['lat_min']; lat_max = lod2_data['lat_max']
+    dlon = max(lon_max - lon_min, 1e-10)
+    dlat = max(lat_max - lat_min, 1e-10)
+    dx = max_x - min_x; dy = max_y - min_y
+    mm_to_units = scale / 1000
+    max_height_units = 20.0 * mm_to_units       # cap silhouette at 20 mm print
+    sink = tc.BUILDING_BASE_SINK_MM * mm_to_units  # push base into the plate to fuse
+
+    def ll_to_xy(lon, lat):
+        x = min_x + (lon - lon_min) / dlon * dx
+        y = min_y + (lat - lat_min) / dlat * dy
+        return x, y
+
+    created = []
+    for b in lod2_data.get('buildings', []):
+        cx, cy = ll_to_xy(b['centroid_lon'], b['centroid_lat'])
+        if not (min_x <= cx <= max_x and min_y <= cy <= max_y):
+            continue
+        base_elev = b['base_elev']
+        ridge = 0.0
+        raw_faces = []
+        for flat in b.get('faces', []):
+            verts = []
+            i = 0
+            while i + 2 < len(flat):
+                vx, vy = ll_to_xy(flat[i], flat[i + 1])
+                vz = flat[i + 2] - base_elev
+                verts.append((vx, vy, vz))
+                if vz > ridge:
+                    ridge = vz
+                i += 3
+            if len(verts) >= 3:
+                raw_faces.append(verts)
+        if not raw_faces:
+            continue
+
+        zfactor = (max_height_units / ridge) if ridge > max_height_units and ridge > 0 else 1.0
+
+        faces_xyz = []
+        for verts in raw_faces:
+            out = []
+            for (vx, vy, vz) in verts:
+                cxx = min(max(vx, min_x), max_x)   # clamp to plate so nothing overhangs
+                cyy = min(max(vy, min_y), max_y)
+                out.append((cxx, cyy, vz * zfactor - sink))
+            faces_xyz.append(out)
+
+        ob = _mesh_from_lod2_faces('LOD2Building', faces_xyz)
+        if ob is not None:
+            created.append(ob)
+
+    return created
+
+
+def create_water_tower(x, y, shaft_height, shaft_radius, tank_radius):
+    """Create a water tower at (x, y): cylinder shaft + sphere tank."""
+    bpy.ops.mesh.primitive_cylinder_add(
+        radius=shaft_radius,
+        depth=shaft_height,
+        location=(x, y, shaft_height / 2),
+        vertices=12,
+        end_fill_type='TRIFAN',
+    )
+    shaft = bpy.context.active_object
+    shaft.name = 'WaterTowerShaft'
+
+    tank_z = shaft_height + tank_radius
+    bpy.ops.mesh.primitive_uv_sphere_add(
+        radius=tank_radius,
+        location=(x, y, tank_z),
+        segments=12,
+        ring_count=8,
+    )
+    tank = bpy.context.active_object
+    tank.name = 'WaterTowerTank'
+
+    bpy.ops.object.select_all(action='DESELECT')
+    shaft.select_set(True)
+    tank.select_set(True)
+    bpy.context.view_layer.objects.active = shaft
+    bpy.ops.object.join()
+    result = bpy.context.active_object
+    result.name = 'WaterTower'
+    return result
+
+
 def _split_mesh_by_components(source_obj):
     """Split a joined mesh into one object per connected component using bmesh (no bpy.ops)."""
     src_mesh = source_obj.data
@@ -202,8 +393,9 @@ def _split_mesh_by_components(source_obj):
     return parts
 
 
-def extrude_buildings_with_heights(joined_obj, height_lookup, default_height):
-    """Split joined building mesh by connected components (via bmesh), extrude each to its OSM height."""
+def extrude_buildings_with_heights(joined_obj, height_lookup, default_height, roof_height=0.0,
+                                   roof_shape_lookup=None):
+    """Split joined building mesh by connected components, extrude each to its OSM height and roof shape."""
     parts = _split_mesh_by_components(joined_obj)
     print("separated {} building parts for individual extrusion".format(len(parts)))
 
@@ -212,8 +404,15 @@ def extrude_buildings_with_heights(joined_obj, height_lookup, default_height):
         bbox = ob.bound_box
         cx = (bbox[0][0] + bbox[6][0]) / 2 + ob.location.x
         cy = (bbox[0][1] + bbox[6][1]) / 2 + ob.location.y
-        h = height_lookup.lookup(cx, cy)
+        h = height_lookup.lookup(cx, cy) if height_lookup else default_height
+        shape = roof_shape_lookup.lookup(cx, cy) if roof_shape_lookup else 'pyramidal'
+
         extrude_building(ob, h)
+        if roof_height > 0:
+            try:
+                apply_roof(ob, shape, roof_height)
+            except Exception as e:
+                print("WARNING: roof failed ({}) at ({:.1f},{:.1f}): {}".format(shape, cx, cy, e))
         fatten(ob)
 
     return parts
@@ -242,6 +441,9 @@ def do_cmdline():
     parser.add_argument('--export-wireframe-png', action='store_true', help="export orthographic top-view wireframe PNG")
     parser.add_argument('--base-path', help='base output path (without extension), defaults to first input path')
     parser.add_argument('--building-heights-json', help='path to JSON with per-building heights from OSM')
+    parser.add_argument('--water-towers-json', help='path to JSON with water tower positions from OSM')
+    parser.add_argument('--roof-shapes-json', help='path to JSON with per-building roof shapes from OSM')
+    parser.add_argument('--lod2-json', help='path to JSON with LOD2 building geometries from NRW WFS')
     parser.add_argument('--elevation-json', help='path to elevation grid JSON for terrain')
     parser.add_argument('--lon-min', type=float, help='map longitude minimum (for terrain)')
     parser.add_argument('--lon-max', type=float, help='map longitude maximum')
@@ -421,11 +623,13 @@ def _export_stl(stl_path, scale):
     print("creating {stl}...".format(stl=stl_path))
     try:
         bpy.ops.export_mesh.stl(filepath=stl_path, check_existing=False,
-                                axis_forward='Y', axis_up='Z', global_scale=(1000 / scale))
+                                axis_forward='Y', axis_up='Z', global_scale=(1000 / scale),
+                                use_selection=True)
     except AttributeError:
-        # Blender 4.x: new operator with renamed parameters
+        # Blender 4.x+: new operator — selection flag renamed to export_selected_objects
         bpy.ops.wm.stl_export(filepath=stl_path, check_existing=False,
-                              forward_axis='Y', up_axis='Z', global_scale=(1000 / scale))
+                              forward_axis='Y', up_axis='Z', global_scale=(1000 / scale),
+                              export_selected_objects=True)
 
 def export_stl(base_path, scale):
     bpy.ops.object.select_all(action='SELECT')
@@ -692,6 +896,201 @@ def extrude_building(ob, height):
     bpy.ops.mesh.normals_make_consistent()
     bpy.ops.object.mode_set(mode = 'OBJECT')
 
+def _boundary_verts_ordered(boundary_edges):
+    """Traverse boundary edges to get footprint vertices in polygon order."""
+    if not boundary_edges:
+        return []
+    adj = {}
+    for e in boundary_edges:
+        v0, v1 = e.verts[0], e.verts[1]
+        adj.setdefault(v0, []).append(v1)
+        adj.setdefault(v1, []).append(v0)
+    for neighbors in adj.values():
+        if len(neighbors) != 2:
+            return []  # non-manifold boundary
+    start = boundary_edges[0].verts[0]
+    ordered = [start]
+    prev, current = None, start
+    while True:
+        nxt = next((n for n in adj[current] if n is not prev), None)
+        if nxt is None or nxt is start:
+            break
+        ordered.append(nxt)
+        prev, current = current, nxt
+    return ordered
+
+
+def _polygon_area_2d(verts):
+    """Shoelace formula for 2D projected area of a polygon (uses x/y, ignores z)."""
+    n = len(verts)
+    if n < 3:
+        return 0.0
+    area = sum(verts[i].co.x * verts[(i+1) % n].co.y -
+               verts[(i+1) % n].co.x * verts[i].co.y for i in range(n))
+    return abs(area) * 0.5
+
+
+def add_pyramid_roof(ob, roof_height):
+    """Replace all top faces with a single-apex pyramid (no gap between triangulated faces)."""
+    bm = bmesh.new()
+    bm.from_mesh(ob.data)
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    if not bm.verts:
+        bm.free()
+        return
+
+    max_z = max(v.co.z for v in bm.verts)
+    eps = 0.001
+    top_faces = [f for f in bm.faces if all(abs(v.co.z - max_z) < eps for v in f.verts)]
+    if not top_faces:
+        bm.free()
+        return
+
+    top_idx_set = set(f.index for f in top_faces)
+    all_top_edges = {e for f in top_faces for e in f.edges}
+
+    # Boundary edges border exactly one top face (= outer perimeter of roof region).
+    # Interior edges border two top faces (= triangulation diagonals, must be removed).
+    boundary_edges = [e for e in all_top_edges
+                      if sum(1 for af in e.link_faces if af.index in top_idx_set) == 1]
+    interior_edges = [e for e in all_top_edges
+                      if sum(1 for af in e.link_faces if af.index in top_idx_set) == 2]
+
+    # Single apex at centroid of all top vertices
+    top_verts = {v for f in top_faces for v in f.verts}
+    cx = sum(v.co.x for v in top_verts) / len(top_verts)
+    cy = sum(v.co.y for v in top_verts) / len(top_verts)
+
+    bmesh.ops.delete(bm, geom=top_faces, context='FACES_ONLY')
+    # Interior edges are now orphaned (no faces); skip deletion — they don't appear in STL
+    # and deleting already-dereferenced faces via 'EDGES' context can crash Blender.
+
+    apex = bm.verts.new((cx, cy, max_z + roof_height))
+    for edge in boundary_edges:
+        v0, v1 = edge.verts[0], edge.verts[1]
+        try:
+            bm.faces.new([v0, v1, apex])
+        except Exception:
+            pass
+
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    bm.to_mesh(ob.data)
+    bm.free()
+    ob.data.update()
+
+def add_gabled_roof(ob, roof_height):
+    """Add a gabled roof: ridge along the principal (long) axis found via PCA."""
+    bm = bmesh.new()
+    bm.from_mesh(ob.data)
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    if not bm.verts:
+        bm.free()
+        return
+
+    max_z = max(v.co.z for v in bm.verts)
+    eps = 0.001
+    top_faces = [f for f in bm.faces if all(abs(v.co.z - max_z) < eps for v in f.verts)]
+    if not top_faces:
+        bm.free()
+        return
+
+    top_idx_set = set(f.index for f in top_faces)
+    all_top_edges = {e for f in top_faces for e in f.edges}
+
+    boundary_edges = [e for e in all_top_edges
+                      if sum(1 for af in e.link_faces if af.index in top_idx_set) == 1]
+    interior_edges = [e for e in all_top_edges
+                      if sum(1 for af in e.link_faces if af.index in top_idx_set) == 2]
+
+    top_verts = list({v for f in top_faces for v in f.verts})
+    xs = [v.co.x for v in top_verts]
+    ys = [v.co.y for v in top_verts]
+    n = len(xs)
+    cx = sum(xs) / n
+    cy = sum(ys) / n
+
+    # PCA: find the principal (long) axis of the building footprint in 2-D
+    cxx = sum((x - cx) ** 2 for x in xs) / n
+    cyy = sum((y - cy) ** 2 for y in ys) / n
+    cxy = sum((x - cx) * (y - cy) for x, y in zip(xs, ys)) / n
+    tr = cxx + cyy
+    disc = max(0.0, (tr / 2) ** 2 - (cxx * cyy - cxy * cxy))
+    lam = tr / 2 + math.sqrt(disc)        # largest eigenvalue
+    if abs(cxy) > 1e-10:
+        dx, dy = lam - cyy, cxy
+    elif cxx >= cyy:
+        dx, dy = 1.0, 0.0
+    else:
+        dx, dy = 0.0, 1.0
+    length = math.sqrt(dx * dx + dy * dy)
+    if length <= 1e-10:
+        # Degenerate (nearly square or tiny building): fall back to pyramid
+        bm.free()
+        add_pyramid_roof(ob, roof_height)
+        return
+    dx /= length
+    dy /= length
+
+    # Project all top vertices onto the long axis to find ridge endpoints
+    projs = [(v.co.x - cx) * dx + (v.co.y - cy) * dy for v in top_verts]
+    p_min, p_max = min(projs), max(projs)
+    p_mid = (p_min + p_max) / 2
+
+    # Rectangularity check: compare actual footprint area to PCA bounding box.
+    # Non-rectangular buildings (L/T/U shapes) get a pyramid instead.
+    ordered_verts = _boundary_verts_ordered(boundary_edges)
+    if ordered_verts:
+        poly_area = _polygon_area_2d(ordered_verts)
+        q_projs = [(v.co.x - cx) * (-dy) + (v.co.y - cy) * dx for v in ordered_verts]
+        pca_bbox_area = (p_max - p_min) * max(max(q_projs) - min(q_projs), 1e-6)
+        if poly_area / max(pca_bbox_area, 1e-6) < 0.65:
+            bm.free()
+            add_pyramid_roof(ob, roof_height)
+            return
+
+    r0 = bm.verts.new((cx + dx * p_min, cy + dy * p_min, max_z + roof_height))
+    r1 = bm.verts.new((cx + dx * p_max, cy + dy * p_max, max_z + roof_height))
+
+    bmesh.ops.delete(bm, geom=top_faces, context='FACES_ONLY')
+    # Interior edges are now orphaned; skip deletion — harmless for STL, avoids crash.
+
+    def ridge_vert(v):
+        proj = (v.co.x - cx) * dx + (v.co.y - cy) * dy
+        return r0 if proj < p_mid else r1
+
+    for edge in boundary_edges:
+        v0, v1 = edge.verts[0], edge.verts[1]
+        rv0 = ridge_vert(v0)
+        rv1 = ridge_vert(v1)
+        try:
+            if rv0 is rv1:
+                # Gable triangle: both verts on same side of ridge
+                bm.faces.new([v0, v1, rv0])
+            else:
+                # Slope face: split into two triangles to avoid non-planar quad
+                bm.faces.new([v0, v1, rv1])
+                bm.faces.new([v0, rv1, rv0])
+        except Exception:
+            pass
+
+    bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+    bm.to_mesh(ob.data)
+    bm.free()
+    ob.data.update()
+
+
+def apply_roof(ob, shape, roof_height):
+    """Dispatch to the right roof generator based on OSM roof:shape."""
+    if shape == 'flat':
+        return
+    if shape in ('gabled', 'hipped'):
+        add_gabled_roof(ob, roof_height)
+    else:
+        add_pyramid_roof(ob, roof_height)
+
+
 def join_selected(name):
     combined = bpy.context.selected_objects[0]
     bpy.context.view_layer.objects.active = combined
@@ -951,7 +1350,7 @@ def do_road_areas(roads, height):
     fatten(roads)
     #print("processing %s took %.2f" % (roads.name, perf_clock() - t))
 
-def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_height_lookup=None):
+def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_height_lookup=None, roof_shape_lookup=None, lod2_data=None):
     t = perf_clock()
     mm_to_units = scale / 1000
     if not no_borders:
@@ -1014,22 +1413,37 @@ def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_heig
     joined_road_areas_ped = join_objects(road_areas_ped, 'PedestrianRoadAreas')
     joined_rails = join_objects(rails, 'Rails')
     joined_buildings = join_objects(buildings, 'Buildings')
-    
+
     # Buildings
-    if joined_buildings:
+    roof_height = tc.BUILDING_ROOF_HEIGHT_MM * mm_to_units
+    if lod2_data is not None:
+        # Real 3D buildings: rebuild each as a solid directly from LOD2 geometry,
+        # discarding the flat OSM footprints (the LOD2 model already has walls +
+        # roof aligned, and is watertight for printing).
         t = perf_clock()
-        if building_height_lookup is not None:
-            # Per-building heights: separate mesh by connected components, extrude each individually
+        if joined_buildings is not None:
+            bpy.data.objects.remove(joined_buildings, do_unlink=True)
+        lod2_objs = build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale)
+        if lod2_objs:
+            join_objects(lod2_objs, 'Buildings')
+        print("built {} LOD2 solid buildings in {:.2f} s".format(len(lod2_objs), perf_clock() - t))
+    elif joined_buildings:
+        t = perf_clock()
+        if building_height_lookup is not None or roof_shape_lookup is not None:
+            # Per-component: individual height and/or roof shape per building
             parts = extrude_buildings_with_heights(
                 joined_buildings, building_height_lookup,
-                default_height=tc.BUILDING_HEIGHT_MM * mm_to_units)
+                default_height=tc.BUILDING_HEIGHT_MM * mm_to_units,
+                roof_height=roof_height,
+                roof_shape_lookup=roof_shape_lookup)
             if parts:
                 join_objects(parts, 'Buildings')
-            print("processed %d buildings with OSM heights in %.2f s" % (len(parts), perf_clock() - t))
+            print("processed {} buildings in {:.2f} s".format(len(parts), perf_clock() - t))
         else:
             extrude_building(joined_buildings, tc.BUILDING_HEIGHT_MM * mm_to_units)
+            add_pyramid_roof(joined_buildings, roof_height)
             fatten(joined_buildings)
-            print("processing %d buildings took %.2f" % (len(buildings), perf_clock() - t))
+            print("processing {} buildings took {:.2f}".format(len(buildings), perf_clock() - t))
 
     # Waters
     t = perf_clock()
@@ -1072,9 +1486,54 @@ def make_tactile_map(args):
         except Exception as e:
             print("WARNING: building heights load failed: " + str(e))
 
+    rs_json = getattr(args, 'roof_shapes_json', None)
+    roof_shape_lookup = None
+    if rs_json and os.path.exists(rs_json):
+        try:
+            with open(rs_json, 'r', encoding='utf-8') as f:
+                rs_data = json.load(f)
+            roof_shape_lookup = RoofShapeLookup(rs_data, min_x, min_y, max_x, max_y)
+            print("roof shapes loaded: {} entries".format(len(rs_data.get('buildings', []))))
+        except Exception as e:
+            print("WARNING: roof shapes load failed: " + str(e))
+
+    lod2_json = getattr(args, 'lod2_json', None)
+    lod2_data = None
+    if lod2_json and os.path.exists(lod2_json):
+        try:
+            with open(lod2_json, 'r', encoding='utf-8') as f:
+                lod2_data = json.load(f)
+            print("LOD2: {} buildings loaded".format(len(lod2_data.get('buildings', []))))
+        except Exception as e:
+            print("WARNING: LOD2 load failed: " + str(e))
+            lod2_data = None
+
     process_objects(min_x, min_y, max_x, max_y, args.scale, args.no_borders,
-                    building_height_lookup=building_height_lookup)
+                    building_height_lookup=building_height_lookup,
+                    roof_shape_lookup=roof_shape_lookup,
+                    lod2_data=lod2_data)
     print("process_objects() took " + (str(perf_clock() - t)))
+
+    # Water towers
+    wt_json = getattr(args, 'water_towers_json', None)
+    if wt_json and os.path.exists(wt_json):
+        try:
+            with open(wt_json, 'r', encoding='utf-8') as f:
+                wt_data = json.load(f)
+            placer = WaterTowerPlacer(wt_data, min_x, min_y, max_x, max_y)
+            mm_to_units = args.scale / 1000
+            shaft_height = tc.BUILDING_HEIGHT_MM * mm_to_units
+            shaft_radius = tc.WATER_TOWER_SHAFT_RADIUS_MM * mm_to_units
+            tank_radius = tc.WATER_TOWER_TANK_RADIUS_MM * mm_to_units
+            wt_objects = []
+            for bx, by in placer.positions:
+                if min_x <= bx <= max_x and min_y <= by <= max_y:
+                    wt_objects.append(create_water_tower(bx, by, shaft_height, shaft_radius, tank_radius))
+            if wt_objects:
+                join_objects(wt_objects, 'WaterTowers')
+                print("created {} water tower(s)".format(len(wt_objects)))
+        except Exception as e:
+            print("WARNING: water towers failed: " + str(e))
 
     # Terrain: apply elevation displacement after tactile processing
     terrain_sampler = None

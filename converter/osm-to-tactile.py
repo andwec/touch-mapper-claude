@@ -73,6 +73,9 @@ def do_cmdline():
     parser.add_argument('--no-borders', action='store_true', help="don't draw borders around the edges")
     parser.add_argument('--exclude-buildings', action='store_true', help="don't include buildings")
     parser.add_argument('--building-heights-json', metavar='PATH', help="path to JSON with per-building heights from OSM")
+    parser.add_argument('--water-towers-json', metavar='PATH', help="path to JSON with water tower positions from OSM")
+    parser.add_argument('--roof-shapes-json', metavar='PATH', help="path to JSON with per-building roof shapes from OSM")
+    parser.add_argument('--lod2-json', metavar='PATH', help="path to JSON with LOD2 building geometries from NRW WFS")
     parser.add_argument('--elevation-json', metavar='PATH', help="path to elevation grid JSON for terrain")
     parser.add_argument('--lon-min', type=float, help="map longitude minimum (for terrain mapping)")
     parser.add_argument('--lon-max', type=float, help="map longitude maximum")
@@ -237,6 +240,12 @@ def run_blender(mesh_paths, boundary, args, output_base_path, telemetry):
         script_args.extend(('--marker1', args.marker1))
     if getattr(args, 'building_heights_json', None):
         script_args.extend(['--building-heights-json', args.building_heights_json])
+    if getattr(args, 'water_towers_json', None):
+        script_args.extend(['--water-towers-json', args.water_towers_json])
+    if getattr(args, 'roof_shapes_json', None):
+        script_args.extend(['--roof-shapes-json', args.roof_shapes_json])
+    if getattr(args, 'lod2_json', None):
+        script_args.extend(['--lod2-json', args.lod2_json])
     if getattr(args, 'elevation_json', None):
         script_args.extend(['--elevation-json', args.elevation_json])
         script_args.extend(['--lon-min', str(args.lon_min), '--lon-max', str(args.lon_max)])

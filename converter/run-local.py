@@ -31,6 +31,11 @@ script_dir = os.path.dirname(os.path.realpath(__file__))
 
 MAX_OSM_BYTES = 25 * 1024 * 1024
 
+# NRW LOD2 open-data tile download (1 km × 1 km CityGML tiles, UTM32N tile index)
+_NRW_LOD2_TILE_BASE = 'https://www.opengeodata.nrw.de/produkte/geobasis/3dg/lod2_gml/lod2_gml/'
+_NRW_LON_MIN, _NRW_LON_MAX = 5.8, 9.5
+_NRW_LAT_MIN, _NRW_LAT_MAX = 50.3, 52.5
+
 
 def write_status(info_path, request_id, progress, error_code=None, error_desc=None):
     status_obj = {'progress': progress}
@@ -348,6 +353,366 @@ def _extract_building_heights(osm_path, eff_area, work_dir):
     return bh_path
 
 
+def _extract_roof_shapes(osm_path, eff_area, work_dir):
+    """Parse OSM for per-building roof shapes using osm_roof_fixer classification logic."""
+    import xml.etree.ElementTree as ET
+    import math as _math
+
+    _FLAT = {'industrial', 'warehouse', 'supermarket', 'retail', 'commercial',
+             'garage', 'garages', 'carport', 'train_station', 'transportation',
+             'parking', 'hangar', 'storage_tank'}
+    _GABLED = {'house', 'detached', 'semidetached_house', 'terrace', 'bungalow',
+               'cabin', 'farm', 'farm_auxiliary', 'barn', 'stable', 'shed', 'greenhouse'}
+    _PYRAMIDAL = {'church', 'chapel', 'cathedral', 'temple', 'mosque', 'synagogue'}
+
+    def _classify(tags, coords):
+        existing = tags.get('roof:shape')
+        if existing:
+            return existing
+        btype = tags.get('building', tags.get('building:part', 'yes'))
+        if btype in _FLAT:
+            return 'flat'
+        if btype in _PYRAMIDAL:
+            return 'pyramidal'
+        if btype in _GABLED:
+            return 'gabled'
+        if coords and len(coords) >= 3:
+            lats = [c[0] for c in coords]
+            lons = [c[1] for c in coords]
+            dlat = (max(lats) - min(lats)) * 111320
+            dlon = (max(lons) - min(lons)) * 111320 * _math.cos(_math.radians(sum(lats) / len(lats)))
+            area = dlat * max(dlon, 0.01)
+            if area > 1500:
+                return 'flat'
+            ratio = max(dlat, dlon) / max(min(dlat, dlon), 0.01)
+            if ratio > 2.5:
+                return 'gabled'
+            if ratio < 1.5:
+                return 'hipped'
+        return 'gabled'
+
+    try:
+        tree = ET.parse(osm_path)
+    except Exception as e:
+        print('roof shapes: OSM parse failed: {}'.format(e), flush=True)
+        return None
+
+    root = tree.getroot()
+    node_map = {}
+    for node in root.findall('node'):
+        nid = node.get('id')
+        lat = node.get('lat')
+        lon = node.get('lon')
+        if nid and lat and lon:
+            node_map[nid] = (float(lat), float(lon))
+
+    buildings = []
+    for way in root.findall('way'):
+        tags = {t.get('k'): t.get('v') for t in way.findall('tag')}
+        if 'building' not in tags and 'building:part' not in tags:
+            continue
+        nds = [node_map[nd.get('ref')] for nd in way.findall('nd') if nd.get('ref') in node_map]
+        if not nds:
+            continue
+        shape = _classify(tags, nds)
+        lat_c = sum(n[0] for n in nds) / len(nds)
+        lon_c = sum(n[1] for n in nds) / len(nds)
+        buildings.append({'lat': lat_c, 'lon': lon_c, 'roof_shape': shape})
+
+    way_index = {w.get('id'): w for w in root.findall('way')}
+    for rel in root.findall('relation'):
+        tags = {t.get('k'): t.get('v') for t in rel.findall('tag')}
+        if 'building' not in tags and 'building:part' not in tags:
+            continue
+        coords = []
+        for member in rel.findall('member'):
+            if member.get('type') == 'way' and member.get('role') == 'outer':
+                w = way_index.get(member.get('ref'))
+                if w is not None:
+                    coords.extend(node_map[nd.get('ref')] for nd in w.findall('nd') if nd.get('ref') in node_map)
+        if not coords:
+            continue
+        shape = _classify(tags, coords)
+        lat_c = sum(c[0] for c in coords) / len(coords)
+        lon_c = sum(c[1] for c in coords) / len(coords)
+        buildings.append({'lat': lat_c, 'lon': lon_c, 'roof_shape': shape})
+
+    if not buildings:
+        print('roof shapes: no buildings found', flush=True)
+        return None
+
+    rs_path = os.path.join(work_dir, 'roof-shapes.json')
+    with open(rs_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'lon_min': eff_area['lonMin'], 'lon_max': eff_area['lonMax'],
+            'lat_min': eff_area['latMin'], 'lat_max': eff_area['latMax'],
+            'buildings': buildings,
+        }, f)
+    shapes = {}
+    for b in buildings:
+        shapes[b['roof_shape']] = shapes.get(b['roof_shape'], 0) + 1
+    print('roof shapes: {} buildings — {}'.format(len(buildings), shapes), flush=True)
+    return rs_path
+
+
+def _extract_water_towers(osm_path, eff_area, work_dir):
+    """Parse OSM file for water tower nodes, write water-towers.json."""
+    import xml.etree.ElementTree as ET
+    try:
+        tree = ET.parse(osm_path)
+    except Exception as e:
+        print('water towers: OSM parse failed: {}'.format(e), flush=True)
+        return None
+
+    towers = []
+    for node in tree.getroot().findall('node'):
+        tags = {t.get('k'): t.get('v') for t in node.findall('tag')}
+        if tags.get('man_made') == 'water_tower':
+            lat = node.get('lat')
+            lon = node.get('lon')
+            if lat and lon:
+                towers.append({'lat': float(lat), 'lon': float(lon)})
+
+    if not towers:
+        print('water towers: none found', flush=True)
+        return None
+
+    wt_path = os.path.join(work_dir, 'water-towers.json')
+    with open(wt_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'lon_min': eff_area['lonMin'], 'lon_max': eff_area['lonMax'],
+            'lat_min': eff_area['latMin'], 'lat_max': eff_area['latMax'],
+            'towers': towers,
+        }, f)
+    print('water towers: {} found'.format(len(towers)), flush=True)
+    return wt_path
+
+
+def _wgs84_to_utm32n(lon, lat):
+    """WGS84 degrees → UTM Zone 32N easting/northing (meters). Pure Python."""
+    a = 6378137.0
+    e2 = 0.00669437999014
+    k0 = 0.9996
+    lam0 = math.radians(9.0)
+    lat_r = math.radians(lat)
+    lon_r = math.radians(lon)
+    N = a / math.sqrt(1 - e2 * math.sin(lat_r) ** 2)
+    T = math.tan(lat_r) ** 2
+    C = e2 / (1 - e2) * math.cos(lat_r) ** 2
+    A_ = (lon_r - lam0) * math.cos(lat_r)
+    M = a * ((1 - e2/4 - 3*e2**2/64 - 5*e2**3/256) * lat_r
+             - (3*e2/8 + 3*e2**2/32 + 45*e2**3/1024) * math.sin(2*lat_r)
+             + (15*e2**2/256 + 45*e2**3/1024) * math.sin(4*lat_r)
+             - (35*e2**3/3072) * math.sin(6*lat_r))
+    E = (k0 * N * (A_ + (1-T+C)*A_**3/6
+         + (5-18*T+T**2+72*C-58*e2/(1-e2))*A_**5/120) + 500000.0)
+    N_ = k0 * (M + N*math.tan(lat_r)*(A_**2/2
+               + (5-T+9*C+4*C**2)*A_**4/24
+               + (61-58*T+T**2+600*C-330*e2/(1-e2))*A_**6/720))
+    return E, N_
+
+
+def _utm32n_to_wgs84(easting, northing):
+    """UTM Zone 32N easting/northing (meters) → WGS84 lon/lat degrees. Pure Python."""
+    a = 6378137.0
+    e2 = 0.00669437999014
+    k0 = 0.9996
+    lam0 = math.radians(9.0)
+    x = easting - 500000.0
+    e1 = (1 - math.sqrt(1 - e2)) / (1 + math.sqrt(1 - e2))
+    mu = northing / (k0 * a * (1 - e2/4 - 3*e2**2/64 - 5*e2**3/256))
+    phi1 = (mu + (3*e1/2 - 27*e1**3/32)*math.sin(2*mu)
+            + (21*e1**2/16 - 55*e1**4/32)*math.sin(4*mu)
+            + (151*e1**3/96)*math.sin(6*mu)
+            + (1097*e1**4/512)*math.sin(8*mu))
+    N1 = a / math.sqrt(1 - e2*math.sin(phi1)**2)
+    T1 = math.tan(phi1)**2
+    C1 = e2/(1-e2)*math.cos(phi1)**2
+    R1 = a*(1-e2)/(1-e2*math.sin(phi1)**2)**1.5
+    D = x / (N1*k0)
+    lat = phi1 - (N1*math.tan(phi1)/R1)*(
+        D**2/2 - (5+3*T1+10*C1-4*C1**2-9*e2/(1-e2))*D**4/24
+        + (61+90*T1+298*C1+45*T1**2-252*e2/(1-e2)-3*C1**2)*D**6/720)
+    lon = lam0 + (D - (1+2*T1+C1)*D**3/6
+                  + (5-2*C1+28*T1-3*C1**2+8*e2/(1-e2)+24*T1**2)*D**5/120) / math.cos(phi1)
+    return math.degrees(lon), math.degrees(lat)
+
+
+def _polygon_exterior_points(poly):
+    """Return the exterior LinearRing points [(easting, northing, z), ...] of a GML Polygon.
+
+    Interior rings (courtyards/holes) are ignored so each surface becomes one
+    simple face. NRW LOD2 posLists store coordinates as easting northing z.
+    """
+    exterior = None
+    for child in poly.iter():
+        if child.tag.endswith('}exterior') or child.tag == 'exterior':
+            exterior = child
+            break
+    target = exterior if exterior is not None else poly
+    for pl in target.iter():
+        if not (pl.tag.endswith('}posList') or pl.tag == 'posList'):
+            continue
+        nums = (pl.text or '').split()
+        pts = []
+        i = 0
+        while i + 2 < len(nums):
+            try:
+                pts.append((float(nums[i]), float(nums[i + 1]), float(nums[i + 2])))
+            except ValueError:
+                pass
+            i += 3
+        return pts
+    return []
+
+
+def _parse_lod2_gml(root):
+    """Parse a CityGML tree into building dicts with full solid geometry.
+
+    Every exterior boundary polygon of a building (GroundSurface + WallSurface +
+    RoofSurface) is collected so the consumer can rebuild a closed, watertight
+    solid. Coordinates are converted UTM32N -> WGS84 lon/lat; z stays in metres.
+    """
+    buildings = []
+    for bldg in root.iter():
+        if not (bldg.tag.endswith('}Building') or bldg.tag == 'Building'):
+            continue
+        faces_utm = []
+        for poly in bldg.iter():
+            if not (poly.tag.endswith('}Polygon') or poly.tag == 'Polygon'):
+                continue
+            pts = _polygon_exterior_points(poly)
+            if len(pts) >= 3:
+                faces_utm.append(pts)
+        if not faces_utm:
+            continue
+        all_pts = [p for face in faces_utm for p in face]
+        base_elev = min(p[2] for p in all_pts)
+        ce = sum(p[0] for p in all_pts) / len(all_pts)
+        cn = sum(p[1] for p in all_pts) / len(all_pts)
+        clon, clat = _utm32n_to_wgs84(ce, cn)
+        faces_wgs84 = []
+        for face in faces_utm:
+            flat = []
+            for (e, n, z) in face:
+                flon, flat_lat = _utm32n_to_wgs84(e, n)
+                flat.extend([flon, flat_lat, z])
+            faces_wgs84.append(flat)
+        buildings.append({
+            'centroid_lon': clon,
+            'centroid_lat': clat,
+            'base_elev': base_elev,
+            'faces': faces_wgs84,
+        })
+    return buildings
+
+
+def _parse_lod2_gml_file(path):
+    """Stream-parse a CityGML file using iterparse to keep memory low. Returns building list."""
+    import xml.etree.ElementTree as ET
+    buildings = []
+    # We accumulate a complete Building element, then hand it to _parse_lod2_gml.
+    # iterparse fires 'end' after all children of an element are parsed, so we
+    # can process the Building sub-tree and then clear it to reclaim memory.
+    in_building = False
+    bldg_elem = None
+    for event, elem in ET.iterparse(path, events=('start', 'end')):
+        is_bldg_tag = elem.tag.endswith('}Building') or elem.tag == 'Building'
+        if event == 'start':
+            if is_bldg_tag and not in_building:
+                in_building = True
+                bldg_elem = elem
+        elif event == 'end':
+            if is_bldg_tag and in_building and elem is bldg_elem:
+                parsed = _parse_lod2_gml(elem)
+                buildings.extend(parsed)
+                in_building = False
+                bldg_elem = None
+                elem.clear()
+    return buildings
+
+
+def _fetch_lod2_roofs(eff_area, work_dir):
+    """Download NRW LOD2 CityGML tiles for the map bbox. Returns JSON path or None.
+
+    Tiles come from the NRW open-data portal (1 km × 1 km, UTM32N tile index).
+    Downloaded tiles are cached in local-data/lod2-cache/ next to the repo root.
+    """
+    lon_min = eff_area['lonMin']
+    lon_max = eff_area['lonMax']
+    lat_min = eff_area['latMin']
+    lat_max = eff_area['latMax']
+
+    if not (lon_min < _NRW_LON_MAX and lon_max > _NRW_LON_MIN and
+            lat_min < _NRW_LAT_MAX and lat_max > _NRW_LAT_MIN):
+        return None  # outside NRW
+
+    buf = 0.001
+    e_min, n_min = _wgs84_to_utm32n(lon_min - buf, lat_min - buf)
+    e_max, n_max = _wgs84_to_utm32n(lon_max + buf, lat_max + buf)
+
+    # Tile index: tile X_Y covers easting [X*1000, (X+1)*1000) and northing [Y*1000, (Y+1)*1000)
+    x_min = int(e_min // 1000)
+    x_max = int(e_max // 1000)
+    y_min = int(n_min // 1000)
+    y_max = int(n_max // 1000)
+
+    cache_dir = os.path.join(script_dir, '..', 'local-data', 'lod2-cache')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    all_buildings = []
+    for x in range(x_min, x_max + 1):
+        for y in range(y_min, y_max + 1):
+            filename = 'LoD2_32_{:d}_{:d}_1_NW.gml'.format(x, y)
+            cache_path = os.path.join(cache_dir, filename)
+
+            if not os.path.exists(cache_path):
+                url = _NRW_LOD2_TILE_BASE + filename
+                print('LOD2: downloading {} ...'.format(filename), flush=True)
+                try:
+                    with urllib.request.urlopen(url, timeout=120) as r:
+                        data = r.read()
+                    tmp = cache_path + '.tmp'
+                    with open(tmp, 'wb') as f:
+                        f.write(data)
+                    os.replace(tmp, cache_path)
+                    print('LOD2: saved {:,.0f} kB'.format(len(data) / 1024), flush=True)
+                except Exception as e:
+                    print('LOD2: download failed ({}): {}'.format(filename, e), flush=True)
+                    tmp = cache_path + '.tmp'
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    continue
+
+            print('LOD2: parsing {} ...'.format(filename), flush=True)
+            try:
+                buildings = _parse_lod2_gml_file(cache_path)
+            except Exception as e:
+                print('LOD2: parse failed ({}): {}'.format(filename, e), flush=True)
+                continue
+
+            for b in buildings:
+                clon = b['centroid_lon']
+                clat = b['centroid_lat']
+                if (lon_min - buf <= clon <= lon_max + buf and
+                        lat_min - buf <= clat <= lat_max + buf):
+                    all_buildings.append(b)
+
+    if not all_buildings:
+        print('LOD2: no buildings found in area', flush=True)
+        return None
+
+    out_path = os.path.join(work_dir, 'lod2-buildings.json')
+    with open(out_path, 'w', encoding='utf-8') as f:
+        json.dump({
+            'lon_min': lon_min, 'lon_max': lon_max,
+            'lat_min': lat_min, 'lat_max': lat_max,
+            'buildings': all_buildings,
+        }, f, separators=(',', ':'))
+    print('LOD2: {} buildings written'.format(len(all_buildings)), flush=True)
+    return out_path
+
+
 def run_osm_to_tactile(work_dir, request_body):
     eff_area = request_body['effectiveArea']
     osm_path = os.path.join(work_dir, 'map.osm')
@@ -369,6 +734,22 @@ def run_osm_to_tactile(work_dir, request_body):
         if bh_path:
             args.extend(['--building-heights-json', bh_path])
 
+    rs_path = _extract_roof_shapes(osm_path, eff_area, work_dir)
+    if rs_path:
+        args.extend(['--roof-shapes-json', rs_path])
+
+    content_mode = request_body.get('contentMode', 'normal')
+
+    # LOD2 supplies the real 3D buildings; skip it entirely when buildings are excluded.
+    if content_mode != 'no-buildings':
+        lod2_path = _fetch_lod2_roofs(eff_area, work_dir)
+        if lod2_path:
+            args.extend(['--lod2-json', lod2_path])
+
+    wt_path = _extract_water_towers(osm_path, eff_area, work_dir)
+    if wt_path:
+        args.extend(['--water-towers-json', wt_path])
+
     if request_body.get('withTerrain'):
         elev_path = fetch_elevation(eff_area, work_dir)
         args.extend(['--elevation-json', elev_path])
@@ -377,7 +758,6 @@ def run_osm_to_tactile(work_dir, request_body):
                      '--lat-min', str(eff_area['latMin']),
                      '--lat-max', str(eff_area['latMax'])])
 
-    content_mode = request_body.get('contentMode', 'normal')
     if content_mode == 'no-buildings':
         args.append('--exclude-buildings')
 
