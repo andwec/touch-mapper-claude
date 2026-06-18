@@ -177,6 +177,9 @@ function initInputs(outputs, osmDragPanInteraction) {
   initSimpleInput("content-mode", $("#content-mode"), "str", "normal");
   initSimpleInput("target-road-density-ui", targetRoadDensityInput, "int", TARGET_ROAD_DENSITY_UI_DEFAULT);
   initSimpleInput("hide-location-marker", $("#hide-location-marker"), "checkbox", false);
+  initSimpleInput("with-borders", $("#with-borders"), "checkbox", false);
+  initSimpleInput("real-building-heights", $("#real-building-heights"), "checkbox", false);
+  initSimpleInput("with-terrain", $("#with-terrain"), "checkbox", false);
   data.on("change:content-mode", updateTargetRoadDensityVisibility);
   data.on("change:target-road-density-ui", function() {
     var normalized = normalizeTargetRoadDensityUiValue(data.get("target-road-density-ui"));

@@ -17,6 +17,208 @@ import tactile_constants as tc
 
 perf_clock = getattr(time, 'perf_counter', time.time)
 
+
+class TerrainSampler:
+    """Bilinear-interpolation sampler over a lat/lon elevation grid mapped to Blender XY coordinates."""
+
+    def __init__(self, elevations, min_x, min_y, max_x, max_y):
+        self.grid = elevations  # [row][col], row = Y (lat) bottom→top, col = X (lon) left→right
+        self.min_x = min_x
+        self.min_y = min_y
+        self.max_x = max_x
+        self.max_y = max_y
+        self.grid_h = len(elevations)
+        self.grid_w = len(elevations[0]) if elevations else 0
+        all_elev = [e for row in elevations for e in row]
+        self.min_elev = min(all_elev) if all_elev else 0.0
+
+    def sample(self, x, y):
+        """Return terrain elevation in Blender units (meters) at world (x, y), min elevation = 0."""
+        fx = (x - self.min_x) / max(self.max_x - self.min_x, 1e-9) * (self.grid_w - 1)
+        fy = (y - self.min_y) / max(self.max_y - self.min_y, 1e-9) * (self.grid_h - 1)
+        fx = max(0.0, min(self.grid_w - 1.0, fx))
+        fy = max(0.0, min(self.grid_h - 1.0, fy))
+        col0 = int(fx); col1 = min(col0 + 1, self.grid_w - 1)
+        row0 = int(fy); row1 = min(row0 + 1, self.grid_h - 1)
+        tx = fx - col0; ty = fy - row0
+        e00 = self.grid[row0][col0] - self.min_elev
+        e10 = self.grid[row0][col1] - self.min_elev
+        e01 = self.grid[row1][col0] - self.min_elev
+        e11 = self.grid[row1][col1] - self.min_elev
+        return e00*(1-tx)*(1-ty) + e10*tx*(1-ty) + e01*(1-tx)*ty + e11*tx*ty
+
+
+def create_terrain_solid(sampler, min_x, min_y, max_x, max_y, base_below_z, overlap=0.0, grid_size=40):
+    """Create a closed solid terrain mesh (top surface + walls + flat bottom)."""
+    top_verts = []
+    bot_verts = []
+    for row in range(grid_size):
+        for col in range(grid_size):
+            x = min_x + (max_x - min_x) * col / (grid_size - 1)
+            y = min_y + (max_y - min_y) * row / (grid_size - 1)
+            # Raise terrain surface by overlap so roads/buildings embed slightly into it
+            z = sampler.sample(x, y) + overlap
+            top_verts.append((x, y, z))
+            bot_verts.append((x, y, base_below_z))
+
+    n = grid_size * grid_size
+    verts = top_verts + bot_verts
+    faces = []
+
+    def top(r, c): return r * grid_size + c
+    def bot(r, c): return n + r * grid_size + c
+
+    for row in range(grid_size - 1):
+        for col in range(grid_size - 1):
+            # Top surface (normal +Z → CCW from above)
+            faces.append((top(row,col), top(row,col+1), top(row+1,col+1), top(row+1,col)))
+            # Bottom surface (normal -Z → CW from above)
+            faces.append((bot(row,col), bot(row+1,col), bot(row+1,col+1), bot(row,col+1)))
+
+    last = grid_size - 1
+    for col in range(grid_size - 1):  # front wall (row=0, normal -Y)
+        faces.append((top(0,col), bot(0,col), bot(0,col+1), top(0,col+1)))
+    for col in range(grid_size - 1):  # back wall (row=last, normal +Y)
+        faces.append((top(last,col+1), bot(last,col+1), bot(last,col), top(last,col)))
+    for row in range(grid_size - 1):  # left wall (col=0, normal -X)
+        faces.append((top(row+1,0), bot(row+1,0), bot(row,0), top(row,0)))
+    for row in range(grid_size - 1):  # right wall (col=last, normal +X)
+        faces.append((top(row,last), bot(row,last), bot(row+1,last), top(row+1,last)))
+
+    mesh = bpy.data.meshes.new('TerrainMesh')
+    obj = bpy.data.objects.new('TerrainSolid', mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    bpy.context.view_layer.objects.active = obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    print("terrain solid created: {} verts {} faces".format(len(verts), len(faces)))
+    return obj
+
+
+def apply_terrain_to_objects(sampler):
+    """Raise all map mesh vertices by terrain elevation at their (x, y) position."""
+    for ob in list(bpy.context.scene.objects):
+        if ob.type != 'MESH' or ob.name in ('TerrainSolid', 'Base', 'Borders', 'CornerInside', 'CornerTop'):
+            continue
+        mesh = ob.data
+        # Objects have identity transform in this pipeline, so world coords == local coords
+        for v in mesh.vertices:
+            v.co.z += sampler.sample(v.co.x, v.co.y)
+        mesh.update()
+    bpy.context.view_layer.update()
+    print("terrain displacement applied to all map objects")
+
+
+class BuildingHeightLookup:
+    """Spatial lookup: given Blender (x, y) returns building height in Blender units (meters).
+    Heights are clamped: minimum = default (4mm print), maximum = 20mm print height.
+    1 Blender unit = 1 metre = 1000/scale mm in print.
+    """
+
+    def __init__(self, bh_data, min_x, min_y, max_x, max_y, default_height_units, scale):
+        self.default = default_height_units
+        self.max_height = 20.0 * scale / 1000  # 20mm print → Blender units
+        lon_min = bh_data['lon_min']; lon_max = bh_data['lon_max']
+        lat_min = bh_data['lat_min']; lat_max = bh_data['lat_max']
+        self.entries = []
+        dx = max_x - min_x; dy = max_y - min_y
+        dlon = lon_max - lon_min; dlat = lat_max - lat_min
+        for b in bh_data.get('buildings', []):
+            if dlon > 0 and dlat > 0:
+                bx = min_x + (b['lon'] - lon_min) / dlon * dx
+                by = min_y + (b['lat'] - lat_min) / dlat * dy
+                self.entries.append((bx, by, b['height_m']))
+
+    def lookup(self, cx, cy, max_dist=30.0):
+        """Return height in Blender units for building centroid (cx, cy)."""
+        best_dist = max_dist * max_dist
+        best_h = None
+        for bx, by, h in self.entries:
+            d2 = (bx - cx) ** 2 + (by - cy) ** 2
+            if d2 < best_dist:
+                best_dist = d2
+                best_h = h
+        if best_h is None:
+            return self.default
+        # Clamp: at least default height, at most 20mm print height
+        return max(self.default, min(self.max_height, best_h))
+
+
+def _split_mesh_by_components(source_obj):
+    """Split a joined mesh into one object per connected component using bmesh (no bpy.ops)."""
+    src_mesh = source_obj.data
+    bm = bmesh.new()
+    bm.from_mesh(src_mesh)
+    bm.verts.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    # BFS to find connected components (sets of face indices)
+    visited_verts = set()
+    components = []
+    for start in bm.verts:
+        if start.index in visited_verts:
+            continue
+        comp_verts = set()
+        comp_faces = set()
+        queue = [start]
+        while queue:
+            v = queue.pop()
+            if v.index in visited_verts:
+                continue
+            visited_verts.add(v.index)
+            comp_verts.add(v.index)
+            for edge in v.link_edges:
+                for ov in edge.verts:
+                    if ov.index not in visited_verts:
+                        queue.append(ov)
+            for face in v.link_faces:
+                comp_faces.add(face.index)
+        if comp_faces:
+            components.append(comp_faces)
+    bm.free()
+
+    parts = []
+    all_face_indices = set(range(len(src_mesh.polygons)))
+    for comp_faces in components:
+        bm2 = bmesh.new()
+        bm2.from_mesh(src_mesh)
+        bm2.faces.ensure_lookup_table()
+        to_del = [f for f in bm2.faces if f.index not in comp_faces]
+        bmesh.ops.delete(bm2, geom=to_del, context='FACES')
+        new_mesh = bpy.data.meshes.new('BuildingPart')
+        bm2.to_mesh(new_mesh)
+        bm2.free()
+        new_mesh.update()
+        new_obj = bpy.data.objects.new('BuildingPart', new_mesh)
+        new_obj.location = source_obj.location.copy()
+        bpy.context.scene.collection.objects.link(new_obj)
+        parts.append(new_obj)
+
+    bpy.data.objects.remove(source_obj, do_unlink=True)
+    return parts
+
+
+def extrude_buildings_with_heights(joined_obj, height_lookup, default_height):
+    """Split joined building mesh by connected components (via bmesh), extrude each to its OSM height."""
+    parts = _split_mesh_by_components(joined_obj)
+    print("separated {} building parts for individual extrusion".format(len(parts)))
+
+    for ob in parts:
+        bpy.context.view_layer.objects.active = ob
+        bbox = ob.bound_box
+        cx = (bbox[0][0] + bbox[6][0]) / 2 + ob.location.x
+        cy = (bbox[0][1] + bbox[6][1]) / 2 + ob.location.y
+        h = height_lookup.lookup(cx, cy)
+        extrude_building(ob, h)
+        fatten(ob)
+
+    return parts
+
+
 # Try the Blender 2.78 bundled svgwrite location first; if it doesn't exist
 # (e.g. newer Blender or custom install), fall back to system Python path.
 _b278_svgwrite = os.path.join(script_dir, 'blender', '2.78', 'python', 'lib', 'python3.5', 'svgwrite')
@@ -39,6 +241,12 @@ def do_cmdline():
     parser.add_argument('--no-borders', action='store_true', help="don't draw borders around the edges")
     parser.add_argument('--export-wireframe-png', action='store_true', help="export orthographic top-view wireframe PNG")
     parser.add_argument('--base-path', help='base output path (without extension), defaults to first input path')
+    parser.add_argument('--building-heights-json', help='path to JSON with per-building heights from OSM')
+    parser.add_argument('--elevation-json', help='path to elevation grid JSON for terrain')
+    parser.add_argument('--lon-min', type=float, help='map longitude minimum (for terrain)')
+    parser.add_argument('--lon-max', type=float, help='map longitude maximum')
+    parser.add_argument('--lat-min', type=float, help='map latitude minimum')
+    parser.add_argument('--lat-max', type=float, help='map latitude maximum')
     parser.add_argument('mesh_paths', metavar='PATHS', nargs='+', help='.obj/.ply files to use as input')
     args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
     return args
@@ -743,7 +951,7 @@ def do_road_areas(roads, height):
     fatten(roads)
     #print("processing %s took %.2f" % (roads.name, perf_clock() - t))
 
-def process_objects(min_x, min_y, max_x, max_y, scale, no_borders):
+def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_height_lookup=None):
     t = perf_clock()
     mm_to_units = scale / 1000
     if not no_borders:
@@ -810,9 +1018,18 @@ def process_objects(min_x, min_y, max_x, max_y, scale, no_borders):
     # Buildings
     if joined_buildings:
         t = perf_clock()
-        extrude_building(joined_buildings, tc.BUILDING_HEIGHT_MM * mm_to_units)
-        fatten(joined_buildings)
-        print("processing %d buildings took %.2f" % (len(buildings), perf_clock() - t))
+        if building_height_lookup is not None:
+            # Per-building heights: separate mesh by connected components, extrude each individually
+            parts = extrude_buildings_with_heights(
+                joined_buildings, building_height_lookup,
+                default_height=tc.BUILDING_HEIGHT_MM * mm_to_units)
+            if parts:
+                join_objects(parts, 'Buildings')
+            print("processed %d buildings with OSM heights in %.2f s" % (len(parts), perf_clock() - t))
+        else:
+            extrude_building(joined_buildings, tc.BUILDING_HEIGHT_MM * mm_to_units)
+            fatten(joined_buildings)
+            print("processing %d buildings took %.2f" % (len(buildings), perf_clock() - t))
 
     # Waters
     t = perf_clock()
@@ -839,14 +1056,63 @@ def make_tactile_map(args):
     t = perf_clock()
     min_x, min_y, max_x, max_y = (args.min_x, args.min_y, args.max_x, args.max_y)
 
-    process_objects(min_x, min_y, max_x, max_y, args.scale, args.no_borders)
+    bh_json = getattr(args, 'building_heights_json', None)
+    elev_json = getattr(args, 'elevation_json', None)
+
+    building_height_lookup = None
+    if bh_json and os.path.exists(bh_json):
+        try:
+            with open(bh_json, 'r', encoding='utf-8') as f:
+                bh_data = json.load(f)
+            building_height_lookup = BuildingHeightLookup(
+                bh_data, min_x, min_y, max_x, max_y,
+                default_height_units=tc.BUILDING_HEIGHT_MM * (args.scale / 1000),
+                scale=args.scale)
+            print("building heights loaded: {} entries".format(len(bh_data.get('buildings', []))))
+        except Exception as e:
+            print("WARNING: building heights load failed: " + str(e))
+
+    process_objects(min_x, min_y, max_x, max_y, args.scale, args.no_borders,
+                    building_height_lookup=building_height_lookup)
     print("process_objects() took " + (str(perf_clock() - t)))
 
-    # Create the support cube and borders
-    base_cube = create_bounds(min_x, min_y, max_x, max_y, args.scale, args.no_borders)
+    # Terrain: apply elevation displacement after tactile processing
+    terrain_sampler = None
+    if elev_json and os.path.exists(elev_json):
+        try:
+            with open(elev_json, 'r', encoding='utf-8') as f:
+                elev_data = json.load(f)
+            terrain_sampler = TerrainSampler(
+                elev_data['elevations'], min_x, min_y, max_x, max_y)
+            print("terrain sampler ready, min_elev={:.1f}m, grid={}x{}".format(
+                terrain_sampler.min_elev, terrain_sampler.grid_h, terrain_sampler.grid_w))
+            apply_terrain_to_objects(terrain_sampler)
+        except Exception as e:
+            print("WARNING: terrain failed: " + str(e))
+            terrain_sampler = None
+
+    # Create the support base and optional borders
+    mm_to_units = args.scale / 1000
+    base_height = tc.BASE_HEIGHT_MM * mm_to_units
+    overlap = tc.BASE_OVERLAP_MM * mm_to_units
+    base_bottom_z = -base_height + overlap
+
+    if terrain_sampler is not None:
+        # Replace flat base cube with a solid terrain slab
+        terrain_obj = create_terrain_solid(terrain_sampler, min_x, min_y, max_x, max_y,
+                                           base_bottom_z, overlap=overlap, grid_size=150)
+        terrain_obj.name = 'Base'
+        base_cube = terrain_obj
+        if not args.no_borders:
+            add_borders(min_x, min_y, max_x, max_y,
+                        tc.BORDER_WIDTH_MM * mm_to_units,
+                        0, tc.BORDER_HEIGHT_MM * mm_to_units,
+                        (tc.BUILDING_HEIGHT_MM + 1) * mm_to_units)
+    else:
+        base_cube = create_bounds(min_x, min_y, max_x, max_y, args.scale, args.no_borders)
 
     # Add marker(s)
-    if args.marker1 != None:
+    if args.marker1 is not None:
         add_marker1(args, args.scale)
 
     return base_cube

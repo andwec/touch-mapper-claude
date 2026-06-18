@@ -226,7 +226,9 @@
       scale: parseInt(data.get("scale"), 10),
       diameter: Math.round(radius * 2), // larger of x and y diameter in meters
       multipartMode: data.get("multipartMode") || false,
-      noBorders: data.get("multipartMode"),
+      noBorders: !(data.get("with-borders") || false),
+      realBuildingHeights: data.get("real-building-heights") || false,
+      withTerrain: data.get("with-terrain") || false,
       multipartXpc: data.get("multipartXpc"),
       multipartYpc: data.get("multipartYpc"),
       advancedMode: data.get("advancedMode") || false,

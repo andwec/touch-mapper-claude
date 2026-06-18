@@ -72,6 +72,12 @@ def do_cmdline():
     parser.add_argument('--size', metavar='CM', type=float, required=True, help="print size in cm")
     parser.add_argument('--no-borders', action='store_true', help="don't draw borders around the edges")
     parser.add_argument('--exclude-buildings', action='store_true', help="don't include buildings")
+    parser.add_argument('--building-heights-json', metavar='PATH', help="path to JSON with per-building heights from OSM")
+    parser.add_argument('--elevation-json', metavar='PATH', help="path to elevation grid JSON for terrain")
+    parser.add_argument('--lon-min', type=float, help="map longitude minimum (for terrain mapping)")
+    parser.add_argument('--lon-max', type=float, help="map longitude maximum")
+    parser.add_argument('--lat-min', type=float, help="map latitude minimum")
+    parser.add_argument('--lat-max', type=float, help="map latitude maximum")
     args = parser.parse_args()
     return args
 
@@ -229,6 +235,12 @@ def run_blender(mesh_paths, boundary, args, output_base_path, telemetry):
         script_args.append('--no-borders')
     if args.marker1:
         script_args.extend(('--marker1', args.marker1))
+    if getattr(args, 'building_heights_json', None):
+        script_args.extend(['--building-heights-json', args.building_heights_json])
+    if getattr(args, 'elevation_json', None):
+        script_args.extend(['--elevation-json', args.elevation_json])
+        script_args.extend(['--lon-min', str(args.lon_min), '--lon-max', str(args.lon_max)])
+        script_args.extend(['--lat-min', str(args.lat_min), '--lat-max', str(args.lat_max)])
     cmd = [blender_path] + blender_args + ['--python', obj_to_tactile_path, '--'] + script_args + mesh_paths
     run_result = telemetry.run_subprocess(
         cmd,
