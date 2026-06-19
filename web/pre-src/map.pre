@@ -467,6 +467,7 @@ window.TM = { translations: {
           <li class="hidden-for-2d"><a class="other-downloads-link" id="download-svg-embossers" target="_blank" rel="noopener noreferrer">{{ download_svg_embossers }}</a></li>
           <li><a class="other-downloads-link" id="download-map-content" target="_blank" rel="noopener noreferrer">{{ download_map_descriptions }}</a></li>
           <li><a class="other-downloads-link" id="download-blender" target="_blank" rel="noopener noreferrer">{{ download_blender }}</a></li>
+          <li style="display: none"><a class="other-downloads-link" id="download-3mf" target="_blank" rel="noopener noreferrer">3MF (alle Elemente getrennt)</a></li>
         </ul>
       </details>
   </div>

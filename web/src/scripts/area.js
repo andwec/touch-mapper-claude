@@ -146,26 +146,12 @@ function initInputs(outputs, osmDragPanInteraction) {
   data.on("change:scale change:size change:printing-tech", updateMapScaleCoverage);
 
   var initDone = false;
-  var initialPrintingTech = getLocalStorageStr('printing-tech', '3d');
+  var initialPrintingTech = '3d'; // 2D printing option removed — always 3D
 
-  // Printing technology
-  $("#printing-tech-3d").change(function(){
-    setData("printing-tech", "3d");
-    $(".hidden-for-3d").hide();
-    $(".hidden-for-2d").show();
-    $("#map-size-preset").change();
-  });
-  $("#printing-tech-2d").change(function(){
-    setData("printing-tech", "2d");
-    $(".hidden-for-3d").show();
-    $(".hidden-for-2d").hide();
-    $("#map-size-input").val(DEFAULT_PRINT_SIZE_2D).change();
-  });
-  if (initialPrintingTech === '2d') {
-    $("#printing-tech-2d").prop('checked', true).change();
-  } else {
-    $("#printing-tech-3d").prop('checked', true).change();
-  }
+  // Printing technology: always 3D.
+  setData("printing-tech", "3d");
+  $(".hidden-for-3d").hide();
+  $(".hidden-for-2d").show();
 
   // Map content selection
   localStorage.removeItem("exclude-buildings");
@@ -180,6 +166,15 @@ function initInputs(outputs, osmDragPanInteraction) {
   initSimpleInput("with-borders", $("#with-borders"), "checkbox", false);
   initSimpleInput("real-building-heights", $("#real-building-heights"), "checkbox", false);
   initSimpleInput("with-terrain", $("#with-terrain"), "checkbox", false);
+
+  // Feature-height factors (1.0 = built-in defaults) and per-element 3MF export
+  initSimpleInput("road-height-factor", $("#road-height-factor"), "float", 1);
+  initSimpleInput("building-height-factor", $("#building-height-factor"), "float", 1);
+  initSimpleInput("base-height-factor", $("#base-height-factor"), "float", 1);
+  initSimpleInput("water-depth-factor", $("#water-depth-factor"), "float", 1);
+  initSimpleInput("terrain-height-factor", $("#terrain-height-factor"), "float", 1);
+  initSimpleInput("terrain-smoothing", $("#terrain-smoothing"), "float", 2);
+  initSimpleInput("export-3mf", $("#export-3mf"), "checkbox", false);
   data.on("change:content-mode", updateTargetRoadDensityVisibility);
   data.on("change:target-road-density-ui", function() {
     var normalized = normalizeTargetRoadDensityUiValue(data.get("target-road-density-ui"));

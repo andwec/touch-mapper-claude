@@ -81,6 +81,12 @@ def do_cmdline():
     parser.add_argument('--lon-max', type=float, help="map longitude maximum")
     parser.add_argument('--lat-min', type=float, help="map latitude minimum")
     parser.add_argument('--lat-max', type=float, help="map latitude maximum")
+    parser.add_argument('--road-height-factor', type=float, default=1.0, help="scale road/rail heights (1.0 = default)")
+    parser.add_argument('--building-height-factor', type=float, default=1.0, help="scale default building heights (1.0 = default)")
+    parser.add_argument('--base-height-factor', type=float, default=1.0, help="scale base plate thickness (1.0 = default)")
+    parser.add_argument('--water-depth-factor', type=float, default=1.0, help="scale water depth (1.0 = default)")
+    parser.add_argument('--terrain-height-factor', type=float, default=1.0, help="scale terrain elevation (0 = flat)")
+    parser.add_argument('--export-3mf', action='store_true', help="also write a 3MF with each element as a separate object")
     args = parser.parse_args()
     return args
 
@@ -250,6 +256,16 @@ def run_blender(mesh_paths, boundary, args, output_base_path, telemetry):
         script_args.extend(['--elevation-json', args.elevation_json])
         script_args.extend(['--lon-min', str(args.lon_min), '--lon-max', str(args.lon_max)])
         script_args.extend(['--lat-min', str(args.lat_min), '--lat-max', str(args.lat_max)])
+    for flag, attr in (('--road-height-factor', 'road_height_factor'),
+                       ('--building-height-factor', 'building_height_factor'),
+                       ('--base-height-factor', 'base_height_factor'),
+                       ('--water-depth-factor', 'water_depth_factor'),
+                       ('--terrain-height-factor', 'terrain_height_factor')):
+        value = getattr(args, attr, None)
+        if value is not None:
+            script_args.extend([flag, str(value)])
+    if getattr(args, 'export_3mf', False):
+        script_args.append('--export-3mf')
     cmd = [blender_path] + blender_args + ['--python', obj_to_tactile_path, '--'] + script_args + mesh_paths
     run_result = telemetry.run_subprocess(
         cmd,

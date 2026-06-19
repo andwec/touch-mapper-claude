@@ -21,7 +21,7 @@ perf_clock = getattr(time, 'perf_counter', time.time)
 class TerrainSampler:
     """Bilinear-interpolation sampler over a lat/lon elevation grid mapped to Blender XY coordinates."""
 
-    def __init__(self, elevations, min_x, min_y, max_x, max_y):
+    def __init__(self, elevations, min_x, min_y, max_x, max_y, height_factor=1.0):
         self.grid = elevations  # [row][col], row = Y (lat) bottom→top, col = X (lon) left→right
         self.min_x = min_x
         self.min_y = min_y
@@ -31,6 +31,8 @@ class TerrainSampler:
         self.grid_w = len(elevations[0]) if elevations else 0
         all_elev = [e for row in elevations for e in row]
         self.min_elev = min(all_elev) if all_elev else 0.0
+        # Vertical exaggeration: 1.0 = real heights, 0.0 = completely flat, >1 = exaggerated.
+        self.height_factor = height_factor
 
     def sample(self, x, y):
         """Return terrain elevation in Blender units (meters) at world (x, y), min elevation = 0."""
@@ -45,7 +47,8 @@ class TerrainSampler:
         e10 = self.grid[row0][col1] - self.min_elev
         e01 = self.grid[row1][col0] - self.min_elev
         e11 = self.grid[row1][col1] - self.min_elev
-        return e00*(1-tx)*(1-ty) + e10*tx*(1-ty) + e01*(1-tx)*ty + e11*tx*ty
+        elev = e00*(1-tx)*(1-ty) + e10*tx*(1-ty) + e01*(1-tx)*ty + e11*tx*ty
+        return elev * self.height_factor
 
 
 def create_terrain_solid(sampler, min_x, min_y, max_x, max_y, base_below_z, overlap=0.0, grid_size=40):
@@ -99,18 +102,67 @@ def create_terrain_solid(sampler, min_x, min_y, max_x, max_y, base_below_z, over
     return obj
 
 
-def apply_terrain_to_objects(sampler):
-    """Raise all map mesh vertices by terrain elevation at their (x, y) position."""
+def _densify_for_terrain(ob, max_edge):
+    """Subdivide near-horizontal edges longer than max_edge so the object follows the terrain.
+
+    Without this, a long road segment or building footprint edge is a straight chord
+    between two far-apart vertices; the fine terrain surface bulges up between them and
+    buries the feature. Vertical edges (e.g. building walls) have ~zero horizontal length
+    and are left untouched, so geometry growth stays bounded.
+    """
+    max_edge_sq = max_edge * max_edge
+    try:
+        bm = bmesh.new()
+        bm.from_mesh(ob.data)
+        for _ in range(10):
+            bm.edges.ensure_lookup_table()
+            long_edges = [
+                e for e in bm.edges
+                if ((e.verts[0].co.x - e.verts[1].co.x) ** 2 +
+                    (e.verts[0].co.y - e.verts[1].co.y) ** 2) > max_edge_sq
+            ]
+            if not long_edges:
+                break
+            bmesh.ops.subdivide_edges(bm, edges=long_edges, cuts=1, use_grid_fill=False)
+        bm.to_mesh(ob.data)
+        bm.free()
+        ob.data.update()
+    except Exception as e:
+        print("WARNING: terrain densify failed for {}: {}".format(ob.name, e))
+
+
+def apply_terrain_to_objects(sampler, skip_buildings=False):
+    """Raise all map mesh vertices by terrain elevation at their (x, y) position.
+
+    Features are first densified so each road keeps a uniform height above the terrain
+    surface instead of getting bridged over (buried) where the ground rises between
+    sparse vertices. When skip_buildings is set, the 'Buildings' object is left alone
+    (LOD2 buildings are seated on the terrain during construction instead of draped).
+    """
+    skip = ['TerrainSolid', 'Base', 'Borders', 'CornerInside', 'CornerTop']
+    if skip_buildings:
+        skip.append('Buildings')
+    # Densify to roughly the elevation-grid cell size — finer than that the terrain is
+    # just linear interpolation, so there is nothing left to bury features. Keep a 2 m
+    # floor so a very fine (≈1 m) terrain grid doesn't over-tessellate roads/buildings;
+    # the terrain mesh itself still carries the full 1 m detail.
+    cell_x = (sampler.max_x - sampler.min_x) / max(sampler.grid_w - 1, 1)
+    cell_y = (sampler.max_y - sampler.min_y) / max(sampler.grid_h - 1, 1)
+    max_edge = max(min(cell_x, cell_y), 2.0)
+    densify = sampler.height_factor != 0.0  # nothing to bury when terrain is flat
     for ob in list(bpy.context.scene.objects):
-        if ob.type != 'MESH' or ob.name in ('TerrainSolid', 'Base', 'Borders', 'CornerInside', 'CornerTop'):
+        if ob.type != 'MESH' or ob.name in skip:
             continue
-        mesh = ob.data
+        if densify:
+            _densify_for_terrain(ob, max_edge)
         # Objects have identity transform in this pipeline, so world coords == local coords
+        mesh = ob.data
         for v in mesh.vertices:
             v.co.z += sampler.sample(v.co.x, v.co.y)
         mesh.update()
     bpy.context.view_layer.update()
-    print("terrain displacement applied to all map objects")
+    print("terrain displacement applied (densify max_edge={:.2f}m, factor={})".format(
+        max_edge, sampler.height_factor))
 
 
 class BuildingHeightLookup:
@@ -242,15 +294,43 @@ def _mesh_from_lod2_faces(name, faces_xyz, weld_eps=0.02):
     return ob
 
 
-def build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale):
+def _place_building_on_terrain(ob, sampler, base_extra_m=0.5):
+    """Seat a finished building solid on the terrain without burying or floating it.
+
+    The footprint (the building's lowest ring) is dropped to just below the LOWEST
+    terrain under the building, while everything above is lifted to clear the HIGHEST
+    terrain under it. Result: walls/roof always stand fully above ground (never
+    buried), the downhill base reaches down into the terrain (no gap to print), and
+    the building stays a clean vertical solid (no shearing/tilting).
+    """
+    mesh = ob.data
+    if not mesh.vertices:
+        return
+    min_z = min(v.co.z for v in mesh.vertices)
+    eps = 0.02
+    foot = [sampler.sample(v.co.x, v.co.y) for v in mesh.vertices if v.co.z - min_z < eps]
+    if not foot:
+        return
+    t_min = min(foot)
+    t_max = max(foot)
+    floor_z = t_min - base_extra_m
+    for v in mesh.vertices:
+        if v.co.z - min_z < eps:
+            v.co.z = floor_z       # footprint sits below all terrain → fuses with the slab
+        else:
+            v.co.z += t_max        # structure lifted clear of the highest ground
+    mesh.update()
+
+
+def build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale, terrain_sampler=None):
     """Create solid building meshes directly from LOD2 geometry.
 
     Each LOD2 building is rebuilt as a complete closed solid (ground + walls +
-    roof) at its true map position, so the roof always lines up with the walls
-    and the result is watertight for 3D printing. Returns the list of created
-    objects. Buildings whose centroid is outside the map are skipped; vertices
-    that fall outside the map are clamped to the edge so nothing overhangs the
-    base plate.
+    roof) at its true, undistorted map position, so the roof always lines up with
+    the walls and the result is watertight for 3D printing. Any building whose
+    footprint touches the map is built in full (even if it straddles the edge);
+    the part outside the map is removed later by a clean rectangular clip, so edge
+    buildings are never bent or squashed. Returns the list of created objects.
     """
     lon_min = lod2_data['lon_min']; lon_max = lod2_data['lon_max']
     lat_min = lod2_data['lat_min']; lat_max = lod2_data['lat_max']
@@ -267,12 +347,12 @@ def build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale):
         return x, y
 
     created = []
+    clip_box = None
     for b in lod2_data.get('buildings', []):
-        cx, cy = ll_to_xy(b['centroid_lon'], b['centroid_lat'])
-        if not (min_x <= cx <= max_x and min_y <= cy <= max_y):
-            continue
         base_elev = b['base_elev']
         ridge = 0.0
+        bxmin = bymin = 1e18
+        bxmax = bymax = -1e18
         raw_faces = []
         for flat in b.get('faces', []):
             verts = []
@@ -283,28 +363,66 @@ def build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale):
                 verts.append((vx, vy, vz))
                 if vz > ridge:
                     ridge = vz
+                if vx < bxmin: bxmin = vx
+                if vx > bxmax: bxmax = vx
+                if vy < bymin: bymin = vy
+                if vy > bymax: bymax = vy
                 i += 3
             if len(verts) >= 3:
                 raw_faces.append(verts)
         if not raw_faces:
             continue
+        # Keep any building whose footprint overlaps the map (so straddling buildings
+        # are complete); drop only those fully outside. The overhang is clipped below.
+        if bxmax < min_x or bxmin > max_x or bymax < min_y or bymin > max_y:
+            continue
 
         zfactor = (max_height_units / ridge) if ridge > max_height_units and ridge > 0 else 1.0
 
-        faces_xyz = []
-        for verts in raw_faces:
-            out = []
-            for (vx, vy, vz) in verts:
-                cxx = min(max(vx, min_x), max_x)   # clamp to plate so nothing overhangs
-                cyy = min(max(vy, min_y), max_y)
-                out.append((cxx, cyy, vz * zfactor - sink))
-            faces_xyz.append(out)
+        # True coordinates — no clamping, so the building keeps its real shape.
+        faces_xyz = [[(vx, vy, vz * zfactor - sink) for (vx, vy, vz) in verts]
+                     for verts in raw_faces]
 
         ob = _mesh_from_lod2_faces('LOD2Building', faces_xyz)
-        if ob is not None:
-            created.append(ob)
+        if ob is None:
+            continue
 
+        # Only buildings that cross the map edge need cutting; cut each one on its own
+        # (a single clean solid) — far more reliable than a boolean on the joined mesh.
+        if bxmin < min_x or bxmax > max_x or bymin < min_y or bymax > max_y:
+            if clip_box is None:
+                clip_box = create_cube(min_x, min_y, max_x, max_y, -1000.0, 1000.0)
+                clip_box.name = 'BuildingClipBox'
+            _boolean_intersect(ob, clip_box)
+            if not ob.data.polygons:           # fully cut away
+                bpy.data.objects.remove(ob, do_unlink=True)
+                continue
+        # Seat the finished solid on the terrain (after any clip), so it never buries.
+        if terrain_sampler is not None:
+            _place_building_on_terrain(ob, terrain_sampler)
+        created.append(ob)
+
+    if clip_box is not None:
+        bpy.data.objects.remove(clip_box, do_unlink=True)
     return created
+
+
+def _boolean_intersect(ob, box):
+    """Clip ob to the volume of box with an EXACT boolean intersect (applied in place)."""
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+        bpy.context.view_layer.objects.active = ob
+        ob.select_set(True)
+        mod = ob.modifiers.new('Clip', 'BOOLEAN')
+        mod.operation = 'INTERSECT'
+        mod.object = box
+        try:
+            mod.solver = 'EXACT'
+        except Exception:
+            pass
+        bpy.ops.object.modifier_apply(modifier=mod.name)
+    except Exception as e:
+        print("WARNING: building clip failed for {}: {}".format(ob.name, e))
 
 
 def create_water_tower(x, y, shaft_height, shaft_radius, tank_radius):
@@ -449,6 +567,13 @@ def do_cmdline():
     parser.add_argument('--lon-max', type=float, help='map longitude maximum')
     parser.add_argument('--lat-min', type=float, help='map latitude minimum')
     parser.add_argument('--lat-max', type=float, help='map latitude maximum')
+    # User-adjustable feature-height factors (1.0 = built-in default heights).
+    parser.add_argument('--road-height-factor', type=float, default=1.0, help='scale road/rail heights')
+    parser.add_argument('--building-height-factor', type=float, default=1.0, help='scale default (non-LOD2) building heights')
+    parser.add_argument('--base-height-factor', type=float, default=1.0, help='scale base plate thickness')
+    parser.add_argument('--water-depth-factor', type=float, default=1.0, help='scale water/waterway depth')
+    parser.add_argument('--terrain-height-factor', type=float, default=1.0, help='scale terrain elevation (0 = flat)')
+    parser.add_argument('--export-3mf', action='store_true', help='also write a 3MF with each element as a separate object')
     parser.add_argument('mesh_paths', metavar='PATHS', nargs='+', help='.obj/.ply files to use as input')
     args = parser.parse_args(sys.argv[sys.argv.index("--") + 1:])
     return args
@@ -643,6 +768,161 @@ def export_stl_separate(base_path, scale):
     bpy.ops.object.select_all(action='INVERT')
     _export_stl(base_path + '-rest.stl', scale)
 
+def _3mf_group_for(name):
+    """Map a scene object name to one of the user-facing 3MF element groups."""
+    if name == 'SelectedAddress':
+        return 'Marker'
+    if name.startswith('Building') or name.startswith('WaterTower'):
+        return 'Buildings'
+    if name.startswith('Rail') or name.endswith('Roads') or name.endswith('RoadAreas'):
+        return 'Roads'
+    if 'Waterway' in name or name.startswith('River') or name in ('WaterAreas', 'JoinedWaterways'):
+        return 'Water'
+    if name.startswith('Base') or name.startswith('Border') or name.startswith('Corner'):
+        return 'Terrain'
+    return 'Other'
+
+
+def _object_triangles(ob, factor):
+    """Return (verts, tris) for one object, triangulated and scaled to print mm."""
+    bm = bmesh.new()
+    bm.from_mesh(ob.data)
+    bm.transform(ob.matrix_world)
+    bmesh.ops.triangulate(bm, faces=bm.faces[:])
+    bm.verts.ensure_lookup_table()
+    index = {}
+    verts = []
+    for i, v in enumerate(bm.verts):
+        index[v] = i
+        verts.append((v.co.x * factor, v.co.y * factor, v.co.z * factor))
+    tris = [(index[f.verts[0]], index[f.verts[1]], index[f.verts[2]])
+            for f in bm.faces if len(f.verts) == 3]
+    bm.free()
+    return verts, tris
+
+
+def export_3mf(base_path, scale):
+    """Write a single .3mf containing each map element as a separate named object.
+
+    Groups (Roads / Terrain / Water / Buildings / Marker) become distinct 3MF
+    objects so a slicer can assign each its own colour/filament or print settings.
+    """
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    factor = 1000.0 / scale  # Blender metres -> print millimetres (matches STL export)
+
+    # Preserve a friendly, stable object order in the file.
+    order = ['Terrain', 'Roads', 'Water', 'Buildings', 'Marker', 'Other']
+    grouped = {}
+    for ob in bpy.context.scene.objects:
+        if ob.type != 'MESH' or not ob.data.polygons:
+            continue
+        grouped.setdefault(_3mf_group_for(ob.name), []).append(ob)
+
+    objects_xml = []
+    build_xml = []
+    oid = 0
+    for group in order:
+        members = grouped.get(group)
+        if not members:
+            continue
+        all_verts = []
+        all_tris = []
+        base = 0
+        for ob in members:
+            verts, tris = _object_triangles(ob, factor)
+            if not tris:
+                continue
+            all_verts.extend(verts)
+            all_tris.extend((a + base, b + base, c + base) for (a, b, c) in tris)
+            base += len(verts)
+        if not all_tris:
+            continue
+        oid += 1
+        v_xml = ''.join('<vertex x="{:.4f}" y="{:.4f}" z="{:.4f}"/>'.format(*v) for v in all_verts)
+        t_xml = ''.join('<triangle v1="{}" v2="{}" v3="{}"/>'.format(*t) for t in all_tris)
+        objects_xml.append(
+            '<object id="{}" type="model" name="{}"><mesh><vertices>{}</vertices>'
+            '<triangles>{}</triangles></mesh></object>'.format(oid, escape(group), v_xml, t_xml))
+        build_xml.append('<item objectid="{}"/>'.format(oid))
+
+    if not objects_xml:
+        print("3MF: no geometry to export")
+        return
+
+    model = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<model unit="millimeter" xml:lang="en-US" '
+        'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+        '<resources>' + ''.join(objects_xml) + '</resources>'
+        '<build>' + ''.join(build_xml) + '</build></model>')
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>'
+        '</Types>')
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Target="/3D/3dmodel.model" Id="rel0" '
+        'Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>'
+        '</Relationships>')
+
+    path = base_path + '.3mf'
+    print("creating {} ...".format(path))
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml', content_types)
+        z.writestr('_rels/.rels', rels)
+        z.writestr('3D/3dmodel.model', model)
+    print("3MF written with {} separate objects".format(len(objects_xml)))
+
+
+def _make_object_manifold(ob):
+    """Weld, drop interior faces, fix normals and close holes so the mesh is manifold.
+
+    LOD2 buildings in particular pick up a few interior/shared wall faces that leave
+    edges shared by >2 faces; OrcaSlicer / Bambu Studio flag those as non-manifold.
+    """
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = ob
+    ob.select_set(True)
+    bpy.ops.object.mode_set(mode='EDIT')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.remove_doubles(threshold=0.001)
+    bpy.ops.mesh.select_all(action='DESELECT')
+    bpy.ops.mesh.select_mode(type='FACE')
+    bpy.ops.mesh.select_interior_faces()
+    bpy.ops.mesh.delete(type='FACE')
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.normals_make_consistent(inside=False)
+    bpy.ops.mesh.select_all(action='SELECT')
+    bpy.ops.mesh.fill_holes(sides=0)
+    bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def cleanup_meshes_for_export():
+    """Make every map mesh manifold before export (skips the terrain slab, which is
+    a clean grid by construction, to save time on its large face count)."""
+    skip = ('Base', 'TerrainSolid')
+    try:
+        bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+    for ob in list(bpy.context.scene.objects):
+        if ob.type != 'MESH' or ob.name in skip or not ob.data.polygons:
+            continue
+        try:
+            _make_object_manifold(ob)
+        except Exception as e:
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except Exception:
+                pass
+            print("WARNING: manifold cleanup failed for {}: {}".format(ob.name, e))
+
+
 def export_blend_file(base_path):
     blend_path = base_path + '.blend'
     bpy.ops.object.select_all(action='SELECT') # it's handy to have everything selected initially
@@ -792,12 +1072,12 @@ def add_borders(min_x, min_y, max_x, max_y, width, bottom, height, corner_height
     create_cube(max_x - width*0.99, max_y - width*0.99, max_x - width*2.7, max_y - width*2.7, 0, height).name = 'CornerInside'
     create_cube(max_x, max_y, max_x - width*3, max_y - width*3, height*0.99, corner_height).name = 'CornerTop'
 
-def create_bounds(min_x, min_y, max_x, max_y, scale, no_borders):
+def create_bounds(min_x, min_y, max_x, max_y, scale, no_borders, base_height_factor=1.0):
     mm_to_units = scale / 1000
     if not no_borders:
         add_borders(min_x, min_y, max_x, max_y, tc.BORDER_WIDTH_MM * mm_to_units, \
                     0, tc.BORDER_HEIGHT_MM * mm_to_units, (tc.BUILDING_HEIGHT_MM + 1) * mm_to_units)
-    base_height = tc.BASE_HEIGHT_MM * mm_to_units
+    base_height = tc.BASE_HEIGHT_MM * mm_to_units * base_height_factor
     overlap = tc.BASE_OVERLAP_MM * mm_to_units # move cube this much up so that it overlaps enough with objects they merge into one object
     base_cube = create_cube(min_x, min_y, max_x, max_y, -base_height + overlap, overlap)
     base_cube.name = 'Base'
@@ -1350,7 +1630,8 @@ def do_road_areas(roads, height):
     fatten(roads)
     #print("processing %s took %.2f" % (roads.name, perf_clock() - t))
 
-def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_height_lookup=None, roof_shape_lookup=None, lod2_data=None):
+def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_height_lookup=None, roof_shape_lookup=None, lod2_data=None,
+                    road_height_factor=1.0, building_height_factor=1.0, water_depth_factor=1.0, terrain_sampler=None):
     t = perf_clock()
     mm_to_units = scale / 1000
     if not no_borders:
@@ -1414,8 +1695,9 @@ def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_heig
     joined_rails = join_objects(rails, 'Rails')
     joined_buildings = join_objects(buildings, 'Buildings')
 
-    # Buildings
-    roof_height = tc.BUILDING_ROOF_HEIGHT_MM * mm_to_units
+    # Buildings — building_height_factor scales the default (non-LOD2) box + roof heights.
+    roof_height = tc.BUILDING_ROOF_HEIGHT_MM * mm_to_units * building_height_factor
+    default_building_height = tc.BUILDING_HEIGHT_MM * mm_to_units * building_height_factor
     if lod2_data is not None:
         # Real 3D buildings: rebuild each as a solid directly from LOD2 geometry,
         # discarding the flat OSM footprints (the LOD2 model already has walls +
@@ -1423,8 +1705,10 @@ def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_heig
         t = perf_clock()
         if joined_buildings is not None:
             bpy.data.objects.remove(joined_buildings, do_unlink=True)
-        lod2_objs = build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale)
+        lod2_objs = build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale,
+                                         terrain_sampler=terrain_sampler)
         if lod2_objs:
+            # Edge buildings are already cut flush per-building inside build_lod2_buildings.
             join_objects(lod2_objs, 'Buildings')
         print("built {} LOD2 solid buildings in {:.2f} s".format(len(lod2_objs), perf_clock() - t))
     elif joined_buildings:
@@ -1433,38 +1717,39 @@ def process_objects(min_x, min_y, max_x, max_y, scale, no_borders, building_heig
             # Per-component: individual height and/or roof shape per building
             parts = extrude_buildings_with_heights(
                 joined_buildings, building_height_lookup,
-                default_height=tc.BUILDING_HEIGHT_MM * mm_to_units,
+                default_height=default_building_height,
                 roof_height=roof_height,
                 roof_shape_lookup=roof_shape_lookup)
             if parts:
                 join_objects(parts, 'Buildings')
             print("processed {} buildings in {:.2f} s".format(len(parts), perf_clock() - t))
         else:
-            extrude_building(joined_buildings, tc.BUILDING_HEIGHT_MM * mm_to_units)
+            extrude_building(joined_buildings, default_building_height)
             add_pyramid_roof(joined_buildings, roof_height)
             fatten(joined_buildings)
             print("processing {} buildings took {:.2f}".format(len(buildings), perf_clock() - t))
 
-    # Waters
+    # Waters — water_depth_factor scales how deep water/waterways are carved.
     t = perf_clock()
     if len(waterways) > 0:
         joined_waterways = join_objects(waterways, 'JoinedWaterways')
-        raise_ob(joined_waterways, tc.WATERWAY_DEPTH_MM * mm_to_units)
+        raise_ob(joined_waterways, tc.WATERWAY_DEPTH_MM * mm_to_units * water_depth_factor)
     if len(water_areas):
         for water in water_areas:
-            water_wave_pattern(water, tc.WATER_AREA_DEPTH_MM * mm_to_units, scale)
+            water_wave_pattern(water, tc.WATER_AREA_DEPTH_MM * mm_to_units * water_depth_factor, scale)
         join_objects(water_areas, 'WaterAreas')
     print("processing waters took %.2f" % (perf_clock() - t))
 
-    # Rails
+    # Rails — road_height_factor scales road/rail heights.
     if joined_rails != None:
-        do_ways(joined_rails, tc.ROAD_HEIGHT_CAR_MM * mm_to_units * 0.99, min_x, min_y, max_x, max_y) # 0.99 to avoid faces in the same coordinates with roads
+        do_ways(joined_rails, tc.ROAD_HEIGHT_CAR_MM * mm_to_units * 0.99 * road_height_factor, min_x, min_y, max_x, max_y) # 0.99 to avoid faces in the same coordinates with roads
 
-    # Roads
-    do_road_areas(joined_road_areas_car, tc.ROAD_HEIGHT_CAR_MM * mm_to_units)
-    do_road_areas(joined_road_areas_ped, tc.ROAD_HEIGHT_PEDESTRIAN_MM * mm_to_units)
-    do_ways(joined_roads_car, tc.ROAD_HEIGHT_CAR_MM * mm_to_units, min_x, min_y, max_x, max_y)
-    do_ways(joined_roads_ped, tc.ROAD_HEIGHT_PEDESTRIAN_MM * mm_to_units, min_x, min_y, max_x, max_y)
+    # Roads — all road types share one height (no car/pedestrian distinction).
+    road_height = tc.ROAD_HEIGHT_CAR_MM * mm_to_units * road_height_factor
+    do_road_areas(joined_road_areas_car, road_height)
+    do_road_areas(joined_road_areas_ped, road_height)
+    do_ways(joined_roads_car, road_height, min_x, min_y, max_x, max_y)
+    do_ways(joined_roads_ped, road_height, min_x, min_y, max_x, max_y)
 
 def make_tactile_map(args):
     t = perf_clock()
@@ -1508,10 +1793,30 @@ def make_tactile_map(args):
             print("WARNING: LOD2 load failed: " + str(e))
             lod2_data = None
 
+    # Load terrain early so LOD2 buildings can be seated on it during construction
+    # (placed as clean vertical solids that never sink under the ground).
+    terrain_sampler = None
+    if elev_json and os.path.exists(elev_json):
+        try:
+            with open(elev_json, 'r', encoding='utf-8') as f:
+                elev_data = json.load(f)
+            terrain_sampler = TerrainSampler(
+                elev_data['elevations'], min_x, min_y, max_x, max_y,
+                height_factor=getattr(args, 'terrain_height_factor', 1.0))
+            print("terrain sampler ready, min_elev={:.1f}m, grid={}x{}".format(
+                terrain_sampler.min_elev, terrain_sampler.grid_h, terrain_sampler.grid_w))
+        except Exception as e:
+            print("WARNING: terrain load failed: " + str(e))
+            terrain_sampler = None
+
     process_objects(min_x, min_y, max_x, max_y, args.scale, args.no_borders,
                     building_height_lookup=building_height_lookup,
                     roof_shape_lookup=roof_shape_lookup,
-                    lod2_data=lod2_data)
+                    lod2_data=lod2_data,
+                    road_height_factor=getattr(args, 'road_height_factor', 1.0),
+                    building_height_factor=getattr(args, 'building_height_factor', 1.0),
+                    water_depth_factor=getattr(args, 'water_depth_factor', 1.0),
+                    terrain_sampler=terrain_sampler)
     print("process_objects() took " + (str(perf_clock() - t)))
 
     # Water towers
@@ -1535,31 +1840,26 @@ def make_tactile_map(args):
         except Exception as e:
             print("WARNING: water towers failed: " + str(e))
 
-    # Terrain: apply elevation displacement after tactile processing
-    terrain_sampler = None
-    if elev_json and os.path.exists(elev_json):
+    # Terrain: drape the remaining ground features (roads, rails, water, towers) onto
+    # the surface. LOD2 buildings were already seated during construction, so skip them.
+    if terrain_sampler is not None:
         try:
-            with open(elev_json, 'r', encoding='utf-8') as f:
-                elev_data = json.load(f)
-            terrain_sampler = TerrainSampler(
-                elev_data['elevations'], min_x, min_y, max_x, max_y)
-            print("terrain sampler ready, min_elev={:.1f}m, grid={}x{}".format(
-                terrain_sampler.min_elev, terrain_sampler.grid_h, terrain_sampler.grid_w))
-            apply_terrain_to_objects(terrain_sampler)
+            apply_terrain_to_objects(terrain_sampler, skip_buildings=(lod2_data is not None))
         except Exception as e:
-            print("WARNING: terrain failed: " + str(e))
-            terrain_sampler = None
+            print("WARNING: terrain displacement failed: " + str(e))
 
     # Create the support base and optional borders
     mm_to_units = args.scale / 1000
-    base_height = tc.BASE_HEIGHT_MM * mm_to_units
+    base_height = tc.BASE_HEIGHT_MM * mm_to_units * getattr(args, 'base_height_factor', 1.0)
     overlap = tc.BASE_OVERLAP_MM * mm_to_units
     base_bottom_z = -base_height + overlap
 
     if terrain_sampler is not None:
-        # Replace flat base cube with a solid terrain slab
+        # Build the terrain mesh at the elevation grid's resolution so a fine DGM1
+        # grid (≈1 m) shows real detail; never coarser than the legacy 150 grid.
+        terrain_grid = max(terrain_sampler.grid_w, terrain_sampler.grid_h, 150)
         terrain_obj = create_terrain_solid(terrain_sampler, min_x, min_y, max_x, max_y,
-                                           base_bottom_z, overlap=overlap, grid_size=150)
+                                           base_bottom_z, overlap=overlap, grid_size=terrain_grid)
         terrain_obj.name = 'Base'
         base_cube = terrain_obj
         if not args.no_borders:
@@ -1568,7 +1868,8 @@ def make_tactile_map(args):
                         0, tc.BORDER_HEIGHT_MM * mm_to_units,
                         (tc.BUILDING_HEIGHT_MM + 1) * mm_to_units)
     else:
-        base_cube = create_bounds(min_x, min_y, max_x, max_y, args.scale, args.no_borders)
+        base_cube = create_bounds(min_x, min_y, max_x, max_y, args.scale, args.no_borders,
+                                  base_height_factor=getattr(args, 'base_height_factor', 1.0))
 
     # Add marker(s)
     if args.marker1 is not None:
@@ -1593,8 +1894,11 @@ def main():
     base_cube = make_tactile_map(args)
     move_everything([-c for c in get_minimum_coordinate(base_cube)])
     if not args.no_stl_export:
+        cleanup_meshes_for_export()  # make manifold for OrcaSlicer / Bambu Studio
         export_stl(base_path, args.scale)
         export_stl_separate(base_path, args.scale)
+        if getattr(args, 'export_3mf', False):
+            export_3mf(base_path, args.scale)
         export_blend_file(base_path)
     if args.export_wireframe_png:
         final_min_x, final_min_y, _final_min_z, final_max_x, final_max_y, _final_max_z = get_object_world_bounds(base_cube)

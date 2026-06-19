@@ -175,19 +175,38 @@ def _fetch_terrain_rgb_elevations(eff_area, grid_size=40, zoom=15):
     return [[sample(lat, lon) for lon in lons] for lat in lats]
 
 
-def _smooth_elevation_grid(elevations, grid_size, passes=2):
-    """Apply passes of 3×3 average smoothing to reduce DSM artifacts."""
+def _box_blur_once(grid, grid_size):
+    """One 3×3 average pass; edges keep their value."""
+    out = [row[:] for row in grid]
+    for r in range(1, grid_size - 1):
+        for c in range(1, grid_size - 1):
+            out[r][c] = (
+                grid[r-1][c-1] + grid[r-1][c] + grid[r-1][c+1] +
+                grid[r  ][c-1] + grid[r  ][c] + grid[r  ][c+1] +
+                grid[r+1][c-1] + grid[r+1][c] + grid[r+1][c+1]
+            ) / 9.0
+    return out
+
+
+def _smooth_elevation_grid(elevations, grid_size, amount=2.0):
+    """Smooth the elevation grid by a fractional amount (0 = off).
+
+    Each whole unit of `amount` is one full 3×3 box-blur pass; a fractional
+    remainder blends partway toward the next blurred pass, so e.g. 0.2 gives a
+    light 20 % smoothing and 1.5 is one full pass plus a half-strength one.
+    """
+    if amount <= 0:
+        return elevations
     grid = [row[:] for row in elevations]
-    for _ in range(passes):
-        smoothed = [row[:] for row in grid]
-        for r in range(1, grid_size - 1):
-            for c in range(1, grid_size - 1):
-                smoothed[r][c] = (
-                    grid[r-1][c-1] + grid[r-1][c] + grid[r-1][c+1] +
-                    grid[r  ][c-1] + grid[r  ][c] + grid[r  ][c+1] +
-                    grid[r+1][c-1] + grid[r+1][c] + grid[r+1][c+1]
-                ) / 9.0
-        grid = smoothed
+    full_passes = int(amount)
+    frac = amount - full_passes
+    for _ in range(full_passes):
+        grid = _box_blur_once(grid, grid_size)
+    if frac > 0:
+        blurred = _box_blur_once(grid, grid_size)
+        for r in range(grid_size):
+            for c in range(grid_size):
+                grid[r][c] = grid[r][c] * (1.0 - frac) + blurred[r][c] * frac
     return grid
 
 
@@ -209,20 +228,176 @@ def _fetch_elevation_batched(url, locations, batch_size=100, timeout=60):
     return results
 
 
-def fetch_elevation(eff_area, work_dir, grid_size=80):
-    """Fetch elevation grid; primary = Terrain-RGB tiles (AWS, no key), fallback = APIs."""
-    elevations = None
+# NRW DGM1: 1 m bare-earth terrain model, 1 km GeoTIFF tiles (UTM32, like the LOD2 tiles).
+_DGM1_TILE_BASE = 'https://www.opengeodata.nrw.de/produkte/geobasis/hm/dgm1_tiff/dgm1_tiff/'
+_DGM1_TARGET_CELL_M = 1.0   # aim for ~1 m terrain cells (DGM1 native resolution)
+_DGM1_MIN_GRID = 80
+_DGM1_MAX_GRID = 320        # cap polygon count on large maps (320x320 grid)
 
-    # Primary: AWS Terrain-RGB (Terrarium) — free, no rate limit, no API key
+
+def _adaptive_dgm1_grid(eff_area):
+    """Grid resolution sized to ~1 m/cell for the map, clamped to keep polys sane."""
+    mid_lat = (eff_area['latMin'] + eff_area['latMax']) / 2.0
+    width_m = abs(eff_area['lonMax'] - eff_area['lonMin']) * 111320.0 * math.cos(math.radians(mid_lat))
+    height_m = abs(eff_area['latMax'] - eff_area['latMin']) * 111320.0
+    size_m = max(width_m, height_m)
+    grid = int(size_m / _DGM1_TARGET_CELL_M) + 1
+    return max(_DGM1_MIN_GRID, min(grid, _DGM1_MAX_GRID))
+
+
+def _dgm1_load_index(cache_dir):
+    """Download/cache the DGM1 tile index, return dict (tileX, tileY) -> filename."""
+    idx_path = os.path.join(cache_dir, 'dgm1_index.json')
+    if not os.path.exists(idx_path):
+        print('DGM1: downloading tile index ...', flush=True)
+        tmp = idx_path + '.tmp'
+        urllib.request.urlretrieve(_DGM1_TILE_BASE + 'index.json', tmp)
+        os.replace(tmp, idx_path)
+    with open(idx_path, 'r', encoding='utf-8') as f:
+        idx = json.load(f)
+    mapping = {}
+    for ds in idx.get('datasets', []):
+        for fobj in ds.get('files', []):
+            name = fobj.get('name', '')
+            m = re.match(r'dgm1_32_(\d+)_(\d+)_1_nw', name)
+            if m:
+                mapping[(int(m.group(1)), int(m.group(2)))] = name
+    return mapping
+
+
+def _fetch_dgm1_elevation(eff_area, grid_size):
+    """Sample a grid_size x grid_size elevation grid from NRW DGM1 1 m tiles.
+
+    Returns the grid (list of rows) or None if the area is outside NRW / unavailable,
+    so the caller can fall back to the global elevation sources.
+    """
+    lon_min = eff_area['lonMin']; lon_max = eff_area['lonMax']
+    lat_min = eff_area['latMin']; lat_max = eff_area['latMax']
+    if not (lon_min < _NRW_LON_MAX and lon_max > _NRW_LON_MIN and
+            lat_min < _NRW_LAT_MAX and lat_max > _NRW_LAT_MIN):
+        return None  # outside NRW
+
     try:
-        print('fetching elevation from terrain-rgb tiles (AWS) ...', flush=True)
-        elevations = _fetch_terrain_rgb_elevations(eff_area, grid_size=grid_size)
-        print('terrain-rgb: {}x{} grid ready'.format(grid_size, grid_size), flush=True)
+        import numpy as np
+        from PIL import Image
     except Exception as e:
-        print('terrain-rgb failed: {} — trying API fallbacks'.format(e), flush=True)
+        print('DGM1: numpy/PIL unavailable ({}), using fallback'.format(e), flush=True)
+        return None
 
-    # Fallback: OpenTopoData EUDEM → SRTM30m → Open-Elevation
+    cache_dir = os.path.join(script_dir, '..', 'local-data', 'dgm1-cache')
+    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        index = _dgm1_load_index(cache_dir)
+    except Exception as e:
+        print('DGM1: index unavailable ({}), using fallback'.format(e), flush=True)
+        return None
+
+    tiles = {}
+
+    def get_tile(tx, ty):
+        if (tx, ty) in tiles:
+            return tiles[(tx, ty)]
+        arr = None
+        name = index.get((tx, ty))
+        if name:
+            path = os.path.join(cache_dir, name)
+            if not os.path.exists(path):
+                print('DGM1: downloading {} ...'.format(name), flush=True)
+                try:
+                    tmp = path + '.tmp'
+                    urllib.request.urlretrieve(_DGM1_TILE_BASE + name, tmp)
+                    os.replace(tmp, path)
+                except Exception as e:
+                    print('DGM1: download failed ({}): {}'.format(name, e), flush=True)
+            if os.path.exists(path):
+                try:
+                    arr = np.asarray(Image.open(path), dtype='float32')
+                except Exception as e:
+                    print('DGM1: read failed ({}): {}'.format(name, e), flush=True)
+        tiles[(tx, ty)] = arr
+        return arr
+
+    lats = [lat_min + (lat_max - lat_min) * i / (grid_size - 1) for i in range(grid_size)]
+    lons = [lon_min + (lon_max - lon_min) * j / (grid_size - 1) for j in range(grid_size)]
+
+    elevations = []
+    missing = 0
+    for i in range(grid_size):
+        row = []
+        for j in range(grid_size):
+            e, n = _wgs84_to_utm32n(lons[j], lats[i])
+            tx = int(e // 1000); ty = int(n // 1000)
+            arr = get_tile(tx, ty)
+            value = None
+            if arr is not None:
+                h, w = arr.shape
+                fx = e - tx * 1000.0              # column, west->east
+                fy = (ty * 1000.0 + 1000.0) - n   # row, north(top)->south
+                fx = min(max(fx, 0.0), w - 1.0)
+                fy = min(max(fy, 0.0), h - 1.0)
+                x0 = int(fx); y0 = int(fy)
+                x1 = min(x0 + 1, w - 1); y1 = min(y0 + 1, h - 1)
+                tX = fx - x0; tY = fy - y0
+                v = (arr[y0, x0] * (1 - tX) * (1 - tY) + arr[y0, x1] * tX * (1 - tY) +
+                     arr[y1, x0] * (1 - tX) * tY + arr[y1, x1] * tX * tY)
+                v = float(v)
+                if -1000.0 < v < 9000.0:  # reject DGM1 nodata (-9999) / garbage
+                    value = v
+            if value is None:
+                missing += 1
+            row.append(value)
+        elevations.append(row)
+
+    valid = [v for r in elevations for v in r if v is not None]
+    if not valid or missing > grid_size * grid_size * 0.5:
+        print('DGM1: {} of {} samples missing — using fallback'.format(
+            missing, grid_size * grid_size), flush=True)
+        return None
+    mean = sum(valid) / len(valid)
+    for r in range(grid_size):
+        for c in range(grid_size):
+            if elevations[r][c] is None:
+                elevations[r][c] = mean
+    n_tiles = sum(1 for v in tiles.values() if v is not None)
+    print('DGM1: {}x{} grid from {} tile(s), {} samples filled'.format(
+        grid_size, grid_size, n_tiles, missing), flush=True)
+    return elevations
+
+
+def fetch_elevation(eff_area, work_dir, grid_size=80, smoothing_amount=2.0):
+    """Fetch elevation grid; primary (NRW) = DGM1 1 m, then Terrain-RGB tiles, then APIs.
+
+    smoothing_amount controls the box-blur applied at the end (0 = no smoothing,
+    keeping the full DGM1 precision; fractional values give light smoothing).
+    """
+    elevations = None
+    used_grid = grid_size
+
+    # Primary for NRW: DGM1 1 m bare-earth model (far better resolution than SRTM).
+    try:
+        dgm1_grid = _adaptive_dgm1_grid(eff_area)
+        dgm1 = _fetch_dgm1_elevation(eff_area, dgm1_grid)
+        if dgm1 is not None:
+            elevations = dgm1
+            used_grid = dgm1_grid
+            print('elevation source: NRW DGM1 1 m ({}x{} grid)'.format(dgm1_grid, dgm1_grid), flush=True)
+    except Exception as e:
+        print('DGM1 failed: {} — trying other sources'.format(e), flush=True)
+        elevations = None
+
+    # Fallback 1: AWS Terrain-RGB (Terrarium) — free, no rate limit, no API key
     if elevations is None:
+        try:
+            print('fetching elevation from terrain-rgb tiles (AWS) ...', flush=True)
+            elevations = _fetch_terrain_rgb_elevations(eff_area, grid_size=grid_size)
+            used_grid = grid_size
+            print('terrain-rgb: {}x{} grid ready'.format(grid_size, grid_size), flush=True)
+        except Exception as e:
+            print('terrain-rgb failed: {} — trying API fallbacks'.format(e), flush=True)
+
+    # Fallback 2: OpenTopoData EUDEM → SRTM30m → Open-Elevation
+    if elevations is None:
+        used_grid = grid_size
         lats = [eff_area['latMin'] + (eff_area['latMax'] - eff_area['latMin']) * i / (grid_size - 1)
                 for i in range(grid_size)]
         lons = [eff_area['lonMin'] + (eff_area['lonMax'] - eff_area['lonMin']) * j / (grid_size - 1)
@@ -254,11 +429,15 @@ def fetch_elevation(eff_area, work_dir, grid_size=80):
         else:
             raise Exception('All elevation sources failed. Last: ' + str(last_err))
 
-    elevations = _smooth_elevation_grid(elevations, grid_size)
+    if smoothing_amount and smoothing_amount > 0:
+        elevations = _smooth_elevation_grid(elevations, used_grid, amount=smoothing_amount)
+        print('elevation smoothed: amount {}'.format(smoothing_amount), flush=True)
+    else:
+        print('elevation smoothing disabled (full precision)', flush=True)
 
     elev_path = os.path.join(work_dir, 'elevation.json')
     with open(elev_path, 'w', encoding='utf-8') as f:
-        json.dump({'grid_size': grid_size, 'elevations': elevations}, f)
+        json.dump({'grid_size': used_grid, 'elevations': elevations}, f)
     return elev_path
 
 
@@ -751,7 +930,12 @@ def run_osm_to_tactile(work_dir, request_body):
         args.extend(['--water-towers-json', wt_path])
 
     if request_body.get('withTerrain'):
-        elev_path = fetch_elevation(eff_area, work_dir)
+        try:
+            smoothing_amount = float(request_body.get('terrainSmoothing', 2))
+        except (TypeError, ValueError):
+            smoothing_amount = 2.0
+        smoothing_amount = max(0.0, min(smoothing_amount, 10.0))
+        elev_path = fetch_elevation(eff_area, work_dir, smoothing_amount=smoothing_amount)
         args.extend(['--elevation-json', elev_path])
         args.extend(['--lon-min', str(eff_area['lonMin']),
                      '--lon-max', str(eff_area['lonMax']),
@@ -760,6 +944,22 @@ def run_osm_to_tactile(work_dir, request_body):
 
     if content_mode == 'no-buildings':
         args.append('--exclude-buildings')
+
+    # User-adjustable feature-height factors (1.0 = built-in defaults).
+    for key, flag in (('roadHeightFactor', '--road-height-factor'),
+                      ('buildingHeightFactor', '--building-height-factor'),
+                      ('baseHeightFactor', '--base-height-factor'),
+                      ('waterDepthFactor', '--water-depth-factor'),
+                      ('terrainHeightFactor', '--terrain-height-factor')):
+        value = request_body.get(key)
+        if value is not None:
+            try:
+                args.extend([flag, str(float(value))])
+            except (TypeError, ValueError):
+                pass
+
+    if request_body.get('export3mf'):
+        args.append('--export-3mf')
 
     if (not request_body.get('hideLocationMarker') and
             not request_body.get('multipartMode') and
@@ -789,6 +989,8 @@ def copy_outputs(work_dir, out_dir, id_slug):
         'map.blend': id_slug + '.blend',
         'map-content.json': id_slug + '.map-content.json',
     }
+    # 3MF is optional (only when requested); copy it if produced.
+    optional = {'map.3mf': id_slug + '.3mf'}
     for src_name, dst_name in file_map.items():
         src_path = os.path.join(work_dir, src_name)
         dst_path = os.path.join(out_dir, dst_name)
@@ -796,6 +998,11 @@ def copy_outputs(work_dir, out_dir, id_slug):
             shutil.copy2(src_path, dst_path)
         elif not os.path.exists(src_path):
             print('warning: expected output not found: ' + src_name, flush=True)
+    for src_name, dst_name in optional.items():
+        src_path = os.path.join(work_dir, src_name)
+        dst_path = os.path.join(out_dir, dst_name)
+        if src_path != dst_path and os.path.exists(src_path):
+            shutil.copy2(src_path, dst_path)
 
 
 def main():

@@ -38,23 +38,6 @@
     </div>
   </div>
 
-  <div class="main-row printing-tech-row">
-    <div class="col col1">
-      <label>{{ printing_tech }}:</label>
-    </div>
-    <div class="col col2">
-      <span class="printing-tech-container" style="margin-right: 15px">
-       <input type="radio" name="printing-tech" id="printing-tech-3d">
-       <label for="printing-tech-3d">{{ printing_tech__3d }}</label>
-      </span>
-
-      <span class="printing-tech-container">
-       <input type="radio" name="printing-tech" id="printing-tech-2d">
-       <label for="printing-tech-2d">{{ printing_tech__2d }}</label>
-      </span>
-    </div>
-  </div>
-
   <div class="row main-row map-size-preset-row grey-in-advanced">
     <div class="col col1">
       <label for="map-size-preset">{{ map_size }}:</label>
@@ -123,6 +106,109 @@
     <div class="col col2 content-selection-container">
       <input id="hide-location-marker" type="checkbox" />
       <label for="hide-location-marker">{{ hide_location_marker }}</label>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label>Rand:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="with-borders" type="checkbox" />
+      <label for="with-borders">Rand um die Karte drucken</label>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label>Gebaeude:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="real-building-heights" type="checkbox" />
+      <label for="real-building-heights">Echte Gebaeudehoehen aus OSM</label>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label>Gelaende:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="with-terrain" type="checkbox" />
+      <label for="with-terrain">Gelaendehoehen (Berge, Huegel)</label>
+    </div>
+  </div>
+
+  <h3 class="section-heading">Hoehen anpassen</h3>
+  <p class="section-hint">Faktor 1.0 = Standardhoehe. Kleiner = flacher, groesser = hoeher.</p>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label for="road-height-factor">Strassenhoehe:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="road-height-factor" type="number" min="0.1" max="3" step="0.1" value="1" />
+      <span class="height-factor-hint">&times; (Standard 0,82&ndash;1,5&nbsp;mm)</span>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label for="building-height-factor">Gebaeudehoehe (Standard):</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="building-height-factor" type="number" min="0.1" max="3" step="0.1" value="1" />
+      <span class="height-factor-hint">&times; (nur ohne LOD2, Standard 2,9&nbsp;mm)</span>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label for="base-height-factor">Grundplatten-Dicke:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="base-height-factor" type="number" min="0.1" max="5" step="0.1" value="1" />
+      <span class="height-factor-hint">&times; (Standard 0,6&nbsp;mm)</span>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label for="water-depth-factor">Wassertiefe:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="water-depth-factor" type="number" min="0.1" max="3" step="0.1" value="1" />
+      <span class="height-factor-hint">&times; (Standard 1,5&nbsp;mm)</span>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label for="terrain-height-factor">Gelaendehoehe:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="terrain-height-factor" type="number" min="0" max="3" step="0.1" value="1" />
+      <span class="height-factor-hint">&times; (0 = flach, nur mit Gelaende aktiv)</span>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label for="terrain-smoothing">Terrain-Glaettung:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="terrain-smoothing" type="number" min="0" max="10" step="0.1" value="2" />
+      <span class="height-factor-hint">Staerke (0 = aus, 0.2 = leicht, 1 = ein Durchgang)</span>
+    </div>
+  </div>
+
+  <div class="row main-row">
+    <div class="col col1">
+      <label>3MF-Export:</label>
+    </div>
+    <div class="col col2 content-selection-container">
+      <input id="export-3mf" type="checkbox" />
+      <label for="export-3mf">Alle Elemente einzeln in eine 3MF-Datei (Strassen, Gelaende, Wasser, Gebaeude, Marker getrennt)</label>
     </div>
   </div>
 

@@ -105,6 +105,13 @@
     $("#download-map-content").attr("href", makeCloudFrontMapContentUrl(info.requestId));
     $("#svg-preview").attr("src", makeCloudFrontUrlSvg(info.requestId));
 
+    // 3MF (each element a separate object) is only produced when requested.
+    if (info.export3mf) {
+      $("#download-3mf").attr("href", makeCloudFrontUrl3mf(info.requestId)).closest("li").show();
+    } else {
+      $("#download-3mf").closest("li").hide();
+    }
+
     // Only show download links for chosen map type.
     var printingTech = info.printingTech || '3d';
     initPrintingTech(printingTech, info.requestId);

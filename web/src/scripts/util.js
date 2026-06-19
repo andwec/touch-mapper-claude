@@ -157,6 +157,10 @@ function uriEncodeRequestId(rid) {
     return TM_HOST + dataPrefix(id) + '.blend';
   };
 
+  window.makeCloudFrontUrl3mf = function(id) {
+    return TM_HOST + dataPrefix(id) + '.3mf';
+  };
+
   window.makeCloudFrontMapContentUrl = function(id) {
     return TM_HOST + dataPrefix(id) + '.map-content.json';
   };
