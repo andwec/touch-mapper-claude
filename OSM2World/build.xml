@@ -31,12 +31,12 @@
 
     <target name="compile">
 	<mkdir dir="bin"/>
-        <javac target="1.7" source="1.7" optimize="true" encoding="UTF-8" srcdir="src" destdir="bin" classpath="${classpath}" includeantruntime="false"/>
+        <javac target="1.8" source="1.8" optimize="true" encoding="UTF-8" srcdir="src" destdir="bin" classpath="${classpath}" includeantruntime="false"/>
     </target>
 
     <target name="compiledbg">
 	<mkdir dir="bin"/>
-        <javac target="1.7" source="1.7" debug="true" encoding="UTF-8" srcdir="src" destdir="bin" classpath="${classpath}" includeantruntime="false"/>
+        <javac target="1.8" source="1.8" debug="true" encoding="UTF-8" srcdir="src" destdir="bin" classpath="${classpath}" includeantruntime="false"/>
     </target>
 	
     <target name="jar" depends="compile">

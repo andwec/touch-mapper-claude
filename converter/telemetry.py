@@ -202,7 +202,8 @@ class TelemetryLogger(object):
 
         timed_cmd = cmd
         using_time = False
-        if os.path.exists("/usr/bin/time"):
+        import platform as _platform
+        if os.path.exists("/usr/bin/time") and _platform.system() != "Darwin":
             timed_cmd = ["/usr/bin/time", "-v"] + cmd
             using_time = True
         else:

@@ -142,6 +142,9 @@ def apply_terrain_to_objects(sampler, skip_buildings=False):
     skip = ['TerrainSolid', 'Base', 'Borders', 'CornerInside', 'CornerTop']
     if skip_buildings:
         skip.append('Buildings')
+    # Water areas are flat by definition — densifying them causes polygon explosion in
+    # Blender 5.x due to changed subdivide_edges behaviour on large N-gons.
+    skip_densify = skip + ['WaterAreas']
     # Densify to roughly the elevation-grid cell size — finer than that the terrain is
     # just linear interpolation, so there is nothing left to bury features. Keep a 2 m
     # floor so a very fine (≈1 m) terrain grid doesn't over-tessellate roads/buildings;
@@ -153,7 +156,7 @@ def apply_terrain_to_objects(sampler, skip_buildings=False):
     for ob in list(bpy.context.scene.objects):
         if ob.type != 'MESH' or ob.name in skip:
             continue
-        if densify:
+        if densify and ob.name not in skip_densify:
             _densify_for_terrain(ob, max_edge)
         # Objects have identity transform in this pipeline, so world coords == local coords
         mesh = ob.data
@@ -390,10 +393,17 @@ def build_lod2_buildings(lod2_data, min_x, min_y, max_x, max_y, scale, terrain_s
         # Only buildings that cross the map edge need cutting; cut each one on its own
         # (a single clean solid) — far more reliable than a boolean on the joined mesh.
         if bxmin < min_x or bxmax > max_x or bymin < min_y or bymax > max_y:
-            if clip_box is None:
-                clip_box = create_cube(min_x, min_y, max_x, max_y, -1000.0, 1000.0)
-                clip_box.name = 'BuildingClipBox'
+            # Bracket the clip box's Z range to this building's real height (with a small
+            # margin). A non-watertight LOD2 mesh can make the EXACT boolean return the
+            # whole box; bounding Z to the building keeps that failure from producing a
+            # giant spike instead of a ~tall-as-the-building artefact.
+            bzmin = min(vz for face in faces_xyz for (_, _, vz) in face)
+            bzmax = max(vz for face in faces_xyz for (_, _, vz) in face)
+            clip_box = create_cube(min_x, min_y, max_x, max_y, bzmin - 1.0, bzmax + 1.0)
+            clip_box.name = 'BuildingClipBox'
             _boolean_intersect(ob, clip_box)
+            bpy.data.objects.remove(clip_box, do_unlink=True)
+            clip_box = None
             if not ob.data.polygons:           # fully cut away
                 bpy.data.objects.remove(ob, do_unlink=True)
                 continue
@@ -900,6 +910,18 @@ def _make_object_manifold(ob):
     bpy.ops.mesh.select_all(action='SELECT')
     bpy.ops.mesh.fill_holes(sides=0)
     bpy.ops.object.mode_set(mode='OBJECT')
+
+
+def print_mesh_stats(label):
+    objs = [(ob.name, len(ob.data.polygons), len(ob.data.vertices))
+            for ob in bpy.data.objects if ob.type == 'MESH']
+    objs.sort(key=lambda x: -x[1])
+    total_polys = sum(p for _, p, _ in objs)
+    print("\n=== mesh stats: {} ===".format(label))
+    for name, polys, verts in objs:
+        print("  {:30s}  {:>10,} polys  {:>10,} verts".format(name, polys, verts))
+    print("  {:30s}  {:>10,} polys total".format("TOTAL", total_polys))
+    print("")
 
 
 def cleanup_meshes_for_export():
@@ -1413,6 +1435,11 @@ def water_remesh_and_extrude(object, extrude_height):
     max_dimension = max(object.dimensions[0], object.dimensions[1])
     depth = min(max(math.log2(max_dimension) - 1, 2), 8) # Max vertex distance == 2m => max dimension 128 == remesh depth 6 (or so)
     modifier = object.modifiers.new('Modifier', 'REMESH')
+    # Blender 4.x+ defaults the REMESH modifier to VOXEL mode, where octree_depth is
+    # ignored and a fixed voxel_size (0.1 m) is used instead — that remeshes a large
+    # water area at 0.1 m resolution and explodes the poly count into the millions.
+    # Force a mode that actually honours octree_depth.
+    modifier.mode = 'SHARP'
     modifier.octree_depth = math.ceil(depth)
     modifier.use_remove_disconnected = False
     bpy.ops.object.modifier_apply(modifier=modifier.name)
@@ -1894,7 +1921,9 @@ def main():
     base_cube = make_tactile_map(args)
     move_everything([-c for c in get_minimum_coordinate(base_cube)])
     if not args.no_stl_export:
+        print_mesh_stats("before cleanup")
         cleanup_meshes_for_export()  # make manifold for OrcaSlicer / Bambu Studio
+        print_mesh_stats("after cleanup")
         export_stl(base_path, args.scale)
         export_stl_separate(base_path, args.scale)
         if getattr(args, 'export_3mf', False):
